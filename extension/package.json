@@ -1,0 +1,9 @@
+{
+  "name": "synctube-extension",
+  "version": "0.2.0",
+  "description": "SyncTube Chrome Extension — synchronized YouTube watching",
+  "private": true,
+  "scripts": {
+    "lint": "echo 'No linter configured yet'"
+  }
+}

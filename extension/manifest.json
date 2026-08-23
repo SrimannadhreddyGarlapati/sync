@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "SyncTube",
+  "version": "0.2.0",
+  "description": "Watch YouTube videos in perfect sync with friends — play, pause, and seek mirrors instantly across all peers in a room.",
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": [
+        "src/content/adapters/VideoAdapter.js",
+        "src/content/adapters/YouTubeAdapter.js",
+        "src/content/commands/ContentCommands.js",
+        "src/content/ui/OverlayUI.js",
+        "src/content/content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "SyncTube"
+  },
+  "permissions": [
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.youtube.com/*"
+  ],
+  "minimum_chrome_version": "110"
+}

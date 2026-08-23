@@ -1,0 +1,39 @@
+.venv/
+AIAgentPleaseIgnore/
+
+# Node.js
+node_modules/
+dist/
+build/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+gemini.txt
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

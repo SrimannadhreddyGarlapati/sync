@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SyncTube</title>
+  <style>
+    /* ── Reset & Base ────────────────────────────────── */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 320px;
+      min-height: 200px;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
+    }
+
+    /* ── Header ──────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .header .version {
+      font-size: 10px;
+      color: #666;
+      margin-left: auto;
+    }
+
+    /* ── Status Badge ────────────────────────────────── */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-size: 12px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #757575;
+      flex-shrink: 0;
+      transition: background-color 0.3s ease;
+    }
+
+    .status-dot.connected {
+      background: #4caf50;
+    }
+
+    .status-dot.joining {
+      background: #9c27b0;
+    }
+
+    .status-dot.syncing {
+      background: #2196f3;
+    }
+
+    .status-dot.synced {
+      background: #4caf50;
+    }
+
+    .status-dot.drifting {
+      background: #ff9800;
+    }
+
+    .status-dot.reconnecting {
+      background: #f44336;
+    }
+
+    .status-text {
+      flex: 1;
+      color: #aaa;
+      font-weight: 500;
+    }
+
+    /* ── Sections ─────────────────────────────────────── */
+    .section {
+      margin-bottom: 12px;
+    }
+
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #888;
+      margin-bottom: 8px;
+    }
+
+    /* ── Buttons ──────────────────────────────────────── */
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      outline: none;
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none !important;
+      box-shadow: none !important;
+    }
+
+    .btn:not(:disabled):hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .btn:not(:disabled):active {
+      transform: translateY(0);
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: #fff;
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.1);
+      color: #e0e0e0;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+    }
+
+    .btn-secondary:not(:disabled):hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .btn-danger {
+      background: rgba(244, 67, 54, 0.2);
+      color: #ef5350;
+      border: 1px solid rgba(244, 67, 54, 0.3);
+    }
+
+    .btn-danger:not(:disabled):hover {
+      background: rgba(244, 67, 54, 0.3);
+    }
+
+    .btn-warning {
+      background: rgba(255, 152, 0, 0.2);
+      color: #ffb74d;
+      border: 1px solid rgba(255, 152, 0, 0.3);
+    }
+
+    .btn-warning:not(:disabled):hover {
+      background: rgba(255, 152, 0, 0.3);
+    }
+
+    /* ── Input ────────────────────────────────────────── */
+    .input-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    .input {
+      flex: 1;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 14px;
+      font-family: 'Consolas', 'Courier New', monospace;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+
+    .input::placeholder {
+      letter-spacing: 1px;
+      text-transform: none;
+      color: #555;
+    }
+
+    .input:focus {
+      border-color: #667eea;
+    }
+
+    /* ── Room Info ────────────────────────────────────── */
+    .room-info {
+      text-align: center;
+      padding: 16px 12px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+
+    .room-info .label {
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .room-info .code {
+      font-size: 32px;
+      font-family: 'Consolas', 'Courier New', monospace;
+      font-weight: 700;
+      letter-spacing: 6px;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin: 8px 0;
+    }
+
+    .room-info .peer-count {
+      font-size: 12px;
+      color: #aaa;
+      background: rgba(255, 255, 255, 0.1);
+      padding: 4px 10px;
+      border-radius: 12px;
+      display: inline-block;
+    }
+
+    .room-info .peer-count.host {
+      background: rgba(102, 126, 234, 0.2);
+      color: #667eea;
+      border: 1px solid rgba(102, 126, 234, 0.3);
+    }
+
+    /* ── Utilities ────────────────────────────────────── */
+    .hidden {
+      display: none !important;
+    }
+
+    .mt-8 {
+      margin-top: 8px;
+    }
+
+    .mt-12 {
+      margin-top: 12px;
+    }
+
+    /* ── Error message ───────────────────────────────── */
+    .error-msg {
+      font-size: 11px;
+      color: #ef5350;
+      margin-top: 6px;
+      display: none;
+      text-align: center;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Header -->
+  <div class="header">
+    <h1>SyncTube</h1>
+    <span class="version">v0.2.0</span>
+  </div>
+
+  <!-- Status Bar -->
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">Not connected</span>
+  </div>
+
+  <!-- Disconnected View: Create / Join -->
+  <div id="viewDisconnected">
+    <div class="section">
+      <button class="btn btn-primary" id="btnCreate">Create Room</button>
+    </div>
+
+    <div class="section mt-12">
+      <div class="section-title">Or join a room</div>
+      <div class="input-group">
+        <input type="text" class="input" id="inputRoomCode" placeholder="Room code" maxlength="6" autocomplete="off"
+          spellcheck="false">
+        <button class="btn btn-secondary" id="btnJoin" style="width: auto; padding: 10px 20px;">
+          Join
+        </button>
+      </div>
+      <div class="error-msg" id="errorMsg"></div>
+    </div>
+  </div>
+
+  <!-- Connected View: Room Info -->
+  <div id="viewConnected" class="hidden">
+    <div class="room-info">
+      <div class="label">Room Code</div>
+      <div class="code" id="roomCode">------</div>
+      <div class="peer-count" id="peerCount">Participant</div>
+    </div>
+
+    <div class="section">
+      <button class="btn btn-warning" id="btnForceSync"
+        title="Forces all peers to sync to the current tab's video state">⟳ Force Sync</button>
+    </div>
+
+    <div class="section mt-8">
+      <button class="btn btn-danger" id="btnLeave">Leave Room</button>
+    </div>
+  </div>
+
+  <!-- No inline scripts — MV3 compliant -->
+  <script src="popup.js"></script>
+</body>
+
+</html>
