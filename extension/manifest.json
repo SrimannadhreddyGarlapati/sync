@@ -31,7 +31,9 @@
     "storage"
   ],
   "host_permissions": [
-    "*://*.youtube.com/*"
+    "*://*.youtube.com/*",
+    "wss://sync-l5pk.onrender.com/*",
+    "https://sync-l5pk.onrender.com/*"
   ],
   "minimum_chrome_version": "110"
 }
