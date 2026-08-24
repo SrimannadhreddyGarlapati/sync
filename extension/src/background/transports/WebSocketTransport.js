@@ -83,7 +83,7 @@ export class WebSocketTransport extends Transport {
    */
   _doConnect() {
     return new Promise((resolve, reject) => {
-      const url = `ws://127.0.0.1:8000/ws/${this._roomId}/${this._peerId}`;
+      const url = `wss://sync-l5pk.onrender.com/ws/${this._roomId}/${this._peerId}`;
       console.log(`[WebSocketTransport] Connecting to ${url}...`);
       
       let isResolved = false;
