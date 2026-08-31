@@ -10,5 +10,5 @@ def test_server_health():
 
     assert response.status_code == 200
     assert response.json() == {
-        "message": "SyncTube Signaling Server is running"
+        "message": "SyncTube Signaling Server is running!"
     }

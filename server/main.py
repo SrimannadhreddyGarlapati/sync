@@ -37,7 +37,7 @@ async def root() -> dict:
     Health check endpoint for load balancers and deployment monitoring.
     Matches the blueprint requirement.
     """
-    return {"message": "SyncTube Signaling Server is running"}
+    return {"message": "SyncTube Signaling Server is running!"}
 
 @app.websocket("/ws/{room_id}/{peer_id}")
 async def websocket_endpoint(
