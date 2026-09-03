@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SyncTube",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Watch YouTube videos in perfect sync with friends — play, pause, and seek mirrors instantly across all peers in a room.",
   "background": {
     "service_worker": "src/background/service-worker.js",
@@ -28,12 +28,15 @@
   },
   "permissions": [
     "tabs",
-    "storage"
+    "storage",
+    "offscreen"
   ],
   "host_permissions": [
     "*://*.youtube.com/*",
     "wss://sync-l5pk.onrender.com/*",
-    "https://sync-l5pk.onrender.com/*"
+    "https://sync-l5pk.onrender.com/*",
+    "ws://localhost:8000/*",
+    "http://localhost:8000/*"
   ],
-  "minimum_chrome_version": "110"
+  "minimum_chrome_version": "116"
 }

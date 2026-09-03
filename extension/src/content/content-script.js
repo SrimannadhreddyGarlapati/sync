@@ -130,11 +130,18 @@
     overlay.inject();
 
     // ── Wire user actions → IPC to background ────────────────
+    // `isPaused` travels with every action so the receiver can decide whether
+    // to apply latency compensation. A position that is still advancing must be
+    // nudged forward by the network delay; a frozen one must not be.
     adapter.onUserPlay(() => {
       console.log(`${TAG} → Sending PLAY to background`);
       sendToBackground('SYNC_ACTION', {
         type: 'PLAY',
-        data: { videoTime: adapter.getCurrentTime(), videoId: adapter.getVideoId() },
+        data: {
+          videoTime: adapter.getCurrentTime(),
+          videoId: adapter.getVideoId(),
+          isPaused: false,
+        },
       });
     });
 
@@ -142,7 +149,11 @@
       console.log(`${TAG} → Sending PAUSE to background`);
       sendToBackground('SYNC_ACTION', {
         type: 'PAUSE',
-        data: { videoTime: adapter.getCurrentTime(), videoId: adapter.getVideoId() },
+        data: {
+          videoTime: adapter.getCurrentTime(),
+          videoId: adapter.getVideoId(),
+          isPaused: true,
+        },
       });
     });
 
@@ -150,7 +161,11 @@
       console.log(`${TAG} → Sending SEEK to background (t=${newTime.toFixed(2)})`);
       sendToBackground('SYNC_ACTION', {
         type: 'SEEK',
-        data: { videoTime: newTime, videoId: adapter.getVideoId() },
+        data: {
+          videoTime: newTime,
+          videoId: adapter.getVideoId(),
+          isPaused: adapter.isPaused(),
+        },
       });
     });
 

@@ -250,6 +250,37 @@
       border: 1px solid rgba(102, 126, 234, 0.3);
     }
 
+    /* ── Link diagnostics ─────────────────────────────── */
+    .room-info .link-info {
+      display: flex;
+      gap: 6px;
+      justify-content: center;
+      margin-top: 8px;
+    }
+
+    .link-chip {
+      font-size: 10px;
+      letter-spacing: 0.03em;
+      color: #888;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 3px 8px;
+      border-radius: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .link-chip.p2p {
+      color: #4ade80;
+      background: rgba(74, 222, 128, 0.12);
+      border-color: rgba(74, 222, 128, 0.25);
+    }
+
+    .link-chip.relay {
+      color: #fbbf24;
+      background: rgba(251, 191, 36, 0.12);
+      border-color: rgba(251, 191, 36, 0.25);
+    }
+
     /* ── Utilities ────────────────────────────────────── */
     .hidden {
       display: none !important;
@@ -312,6 +343,10 @@
       <div class="label">Room Code</div>
       <div class="code" id="roomCode">------</div>
       <div class="peer-count" id="peerCount">Participant</div>
+      <div class="link-info">
+        <span class="link-chip" id="transportChip" title="Active transport for playback commands">—</span>
+        <span class="link-chip" id="latencyChip" title="Measured round-trip time to the host">—</span>
+      </div>
     </div>
 
     <div class="section">

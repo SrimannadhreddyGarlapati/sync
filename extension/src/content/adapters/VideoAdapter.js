@@ -54,6 +54,26 @@ window.SyncTube.VideoAdapter = class VideoAdapter {
     throw new Error('VideoAdapter: method seek() must be implemented by subclass.');
   }
 
+  /**
+   * Converge on a target position, choosing how based on how far off we are.
+   *
+   * A seek is the obvious way to correct drift and the wrong one for small
+   * errors: it stalls the pipeline, drops frames, and is plainly visible. Since
+   * drift is corrected continuously, using a seek each time would make playback
+   * stutter every couple of seconds. Briefly altering playback rate instead
+   * absorbs a sub-second error over a few seconds without a visible artefact,
+   * which is what lets the drift tolerance be tight enough to matter.
+   *
+   * Implementations should seek only when the error is too large to absorb.
+   *
+   * @param {number} targetTime - Target position in seconds
+   * @param {object} [options]
+   * @param {boolean} [options.isPaused] - Target play state, if it should change
+   */
+  syncTo(targetTime, options = {}) {
+    throw new Error('VideoAdapter: method syncTo() must be implemented by subclass.');
+  }
+
   /* =====================================================================
    * STATE GETTERS (Must be overridden by subclasses)
    * ===================================================================== */

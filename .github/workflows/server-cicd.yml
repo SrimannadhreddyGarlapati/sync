@@ -1,12 +1,30 @@
-name: Server CI/CD
+name: CI/CD
 
 on:
   push:
     branches:
       - main
+  pull_request:
 
 jobs:
-  test:
+  test-extension:
+    name: Test Extension
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run tests
+        working-directory: extension
+        run: npm test
+
+  test-server:
     name: Test Server
     runs-on: ubuntu-latest
 
@@ -32,8 +50,11 @@ jobs:
 
   deploy:
     name: Deploy Server
-    needs: test
+    # Both suites gate the deploy: the extension and the server share a wire
+    # protocol, so a change that breaks one side must not reach production.
+    needs: [test-extension, test-server]
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
       - name: Trigger Render deployment

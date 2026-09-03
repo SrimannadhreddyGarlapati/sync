@@ -1,56 +1,102 @@
 /**
  * WebRTCTransport — Strategy Implementation
- * 
- * Establishes peer-to-peer DataChannel connections for low-latency
- * sync traffic. Only used when room size ≤ 5 users (to avoid O(N²)
- * mesh congestion).
- * 
- * Networks Pillar: Demonstrates ICE/STUN/TURN NAT traversal, SDP
- * offer/answer negotiation, and the WebRTC DataChannel API.
- * 
- * System Design Pillar: Congestion control — automatically falls back
- * to WebSocketTransport when P2P mesh would choke client bandwidth.
+ *
+ * Peer-to-peer DataChannel transport for low-latency sync traffic. Used only
+ * when the room is small enough (≤ 5 peers) that a full mesh does not choke
+ * client uplink with O(N²) sends.
+ *
+ * Where the connections actually live
+ * -----------------------------------
+ * Not here. WebRTC's interfaces are `[Exposed=Window]`, so an MV3 service
+ * worker cannot construct an RTCPeerConnection — the call throws
+ * ReferenceError. The connections are hosted in an offscreen document
+ * (`src/offscreen/`), and this class is the service worker's proxy to it:
+ * it owns the offscreen document's lifecycle, forwards commands, and turns the
+ * events coming back into the Transport interface that ConnectionManager
+ * expects. Every peer connection therefore survives a service-worker restart,
+ * because the offscreen document outlives the worker.
+ *
+ * Networks Pillar: ICE/STUN/TURN NAT traversal, SDP offer/answer negotiation,
+ * and the WebRTC DataChannel API.
+ *
+ * System Design Pillar: Congestion control — falls back to WebSocketTransport
+ * when a P2P mesh would be the wrong shape for the room.
  */
 
 import { Transport } from './Transport.js';
+import { ICE_ENDPOINT } from '../config.js';
+
+/** Path to the offscreen document, relative to the extension root. */
+const OFFSCREEN_PATH = 'src/offscreen/offscreen.html';
+
+/** Messages this class sends to the offscreen document. */
+const OFFSCREEN_TARGET = 'synctube-offscreen';
+
+/** Messages the offscreen document sends back. */
+const WORKER_TARGET = 'synctube-worker';
+
+/** Used until (or unless) the server hands over a better list. */
+const FALLBACK_ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
+
+/** ICE servers are cached for this long so a rejoin does not refetch. */
+const ICE_CACHE_TTL_MS = 30 * 60 * 1000;
 
 export class WebRTCTransport extends Transport {
   constructor() {
     super();
+
+    /** @type {string|null} */
     this._roomId = null;
+
+    /** @type {string|null} */
     this._localPeerId = null;
-    
-    /** @type {Map<string, RTCPeerConnection>} peerId → connection */
-    this._peerConnections = new Map();
 
-    /** @type {Map<string, RTCDataChannel>} peerId → data channel */
-    this._dataChannels = new Map();
-
-    /** @type {Map<string, RTCIceCandidateInit[]>} peerId → queued ICE candidates */
-    this._iceCandidateQueues = new Map();
-
-    /** @type {Function|null} */
+    /** @type {Function|null} Application message sink (ConnectionManager) */
     this._messageCallback = null;
-    
-    /** @type {Function|null} */
+
+    /** @type {Function|null} Outgoing SDP/ICE sink (ConnectionManager) */
     this._signalingCallback = null;
 
-    /** @type {boolean} */
-    this._connected = false;
-
-    /** @type {Function|null} Callback when DataChannel connectivity changes */
+    /** @type {Function|null} Notified when channel connectivity changes */
     this._onChannelStateChangeCallback = null;
-    
-    this._iceServers = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
-    ];
+
+    /** @type {number} Open DataChannels, as last reported by the offscreen doc */
+    this._openChannels = 0;
+
+    /** @type {Promise<void>|null} In-flight offscreen document creation */
+    this._creatingOffscreen = null;
+
+    /**
+     * The INIT payload the offscreen document needs before it can negotiate,
+     * held until it has been acknowledged.
+     *
+     * Creating the document can fail transiently. If INIT were sent only from
+     * connect(), a failure there would leave the document running without a
+     * local peer ID, and it would compute its offerer/answerer role against
+     * `null` — so both peers could end up answering and never connect.
+     * Re-sending it from every call makes the transport self-healing.
+     *
+     * @type {object|null}
+     */
+    this._pendingInit = null;
+
+    /** @type {{servers: RTCIceServer[], fetchedAt: number}|null} */
+    this._iceCache = null;
+
+    // Bound so it can be removed on disconnect.
+    this._boundOffscreenListener = this._handleOffscreenMessage.bind(this);
+    chrome.runtime.onMessage.addListener(this._boundOffscreenListener);
   }
 
+  // ── Transport interface ───────────────────────────────────────
+
   /**
-   * Set up basic room/peer ID context. 
-   * Connections themselves are established on-demand via `connectToPeer`.
-   * 
+   * Prepare the offscreen document and hand it this session's identity.
+   * Connections themselves are established when `syncPeers` names peers.
+   *
    * @param {string} roomId
    * @param {string} peerId
    * @returns {Promise<void>}
@@ -58,340 +104,82 @@ export class WebRTCTransport extends Transport {
   async connect(roomId, peerId) {
     this._roomId = roomId;
     this._localPeerId = peerId;
-    console.log(`[WebRTCTransport] Initialized for room=${roomId}, peer=${peerId}`);
+    this._openChannels = 0;
+
+    const iceServers = await this._getIceServers();
+    this._pendingInit = { op: 'INIT', roomId, peerId, iceServers };
+
+    try {
+      // Send it now if we can; _callOffscreen will retry on any later op.
+      await this._callOffscreen({ op: 'GET_STATE' });
+      console.log(`[WebRTCTransport] Ready for room=${roomId}, peer=${peerId}`);
+    } catch (err) {
+      // Losing P2P does not lose the session: ConnectionManager keeps the
+      // WebSocket relay as the active transport.
+      console.error('[WebRTCTransport] Offscreen document unavailable:', err);
+    }
   }
-  
+
   /**
-   * Set callback for outgoing signaling messages (SDP/ICE).
-   * ConnectionManager provides this to route them through WebSocket.
-   * @param {Function} callback 
+   * Broadcast a wire message to all connected peers.
+   * @param {object} message
+   */
+  send(message) {
+    this._callOffscreen({ op: 'SEND', message })
+      .then((response) => {
+        if (response && response.sent === 0) {
+          console.warn('[WebRTCTransport] send() reached no open data channels');
+        }
+      })
+      .catch((err) => {
+        console.error('[WebRTCTransport] send() failed:', err);
+      });
+  }
+
+  /** @param {Function} callback */
+  onMessage(callback) {
+    this._messageCallback = callback;
+  }
+
+  /**
+   * True when at least one DataChannel is open. ConnectionManager decides
+   * whether that is *enough* channels to carry the room.
+   * @returns {boolean}
+   */
+  isConnected() {
+    return this._openChannels > 0;
+  }
+
+  /** @returns {Promise<void>} */
+  async disconnect() {
+    console.log('[WebRTCTransport] Tearing down all peer connections');
+    this._openChannels = 0;
+    this._roomId = null;
+    this._localPeerId = null;
+    this._pendingInit = null;
+
+    try {
+      await this._callOffscreen({ op: 'TEARDOWN' });
+      await this._closeOffscreenDocument();
+    } catch (err) {
+      console.debug('[WebRTCTransport] Teardown error (ignored):', err);
+    }
+  }
+
+  // ── Signaling, driven by ConnectionManager ───────────────────
+
+  /**
+   * Register the sink for outgoing SDP/ICE messages. ConnectionManager routes
+   * them over the WebSocket, which is always connected for exactly this reason.
+   * @param {Function} callback
    */
   onSignaling(callback) {
     this._signalingCallback = callback;
   }
 
   /**
-   * Check if we already have an active/pending connection to a peer
-   * @param {string} peerId 
-   * @returns {boolean}
-   */
-  hasPeerConnection(peerId) {
-    return this._peerConnections.has(peerId);
-  }
-
-  /**
-   * Initiate a connection to another peer (we are the offerer).
-   * @param {string} peerId 
-   */
-  async connectToPeer(peerId) {
-    if (this.hasPeerConnection(peerId)) {
-      console.warn(`[WebRTCTransport] Connection to ${peerId} already exists or is pending.`);
-      return;
-    }
-    
-    console.log(`[WebRTCTransport] Initiating connection to ${peerId}`);
-    const pc = this._createPeerConnection(peerId);
-    
-    // Create data channel (ordered: true, maxRetransmits: 3 as per blueprint)
-    const dc = pc.createDataChannel('sync', {
-      ordered: true,
-      maxRetransmits: 3 
-    });
-    this._setupDataChannel(peerId, dc);
-    
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      
-      this._sendSignaling('SDP_OFFER', {
-        targetPeerId: peerId,
-        sdp: offer
-      });
-    } catch (err) {
-      console.error(`[WebRTCTransport] Failed to create offer for ${peerId}:`, err);
-      this.removePeer(peerId);
-    }
-  }
-
-  /**
-   * Handle incoming SDP offer (we are the answerer).
-   * @param {string} senderId 
-   * @param {RTCSessionDescriptionInit} sdp 
-   */
-  async handleOffer(senderId, sdp) {
-    if (this.hasPeerConnection(senderId)) {
-      console.warn(`[WebRTCTransport] Glare detected: received offer from ${senderId} but connection already exists. Resetting state.`);
-      this.removePeer(senderId); // Clean slate to prevent negotiation locking
-    }
-    
-    console.log(`[WebRTCTransport] Handling offer from ${senderId}`);
-    const pc = this._createPeerConnection(senderId);
-    
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      this._drainIceCandidates(senderId, pc); // Drain any candidates that arrived early
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      
-      this._sendSignaling('SDP_ANSWER', {
-        targetPeerId: senderId,
-        sdp: answer
-      });
-    } catch (err) {
-      console.error(`[WebRTCTransport] Failed to handle offer from ${senderId}:`, err);
-      this.removePeer(senderId);
-    }
-  }
-
-  /**
-   * Handle incoming SDP answer.
-   * @param {string} senderId 
-   * @param {RTCSessionDescriptionInit} sdp 
-   */
-  async handleAnswer(senderId, sdp) {
-    const pc = this._peerConnections.get(senderId);
-    if (!pc) {
-      console.warn(`[WebRTCTransport] Received answer from unknown peer ${senderId}`);
-      return;
-    }
-    
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      console.log(`[WebRTCTransport] Set remote description (answer) from ${senderId}`);
-      this._drainIceCandidates(senderId, pc);
-    } catch (err) {
-      console.error(`[WebRTCTransport] Failed to set remote answer from ${senderId}:`, err);
-    }
-  }
-
-  /**
-   * Handle incoming ICE candidate.
-   * Prevents race conditions by queueing candidates if the remote description isn't set yet.
-   * @param {string} senderId 
-   * @param {RTCIceCandidateInit} candidate 
-   */
-  async handleIceCandidate(senderId, candidate) {
-    const pc = this._peerConnections.get(senderId);
-    if (!pc) {
-      console.warn(`[WebRTCTransport] Received ICE candidate from unknown peer ${senderId}`);
-      return;
-    }
-    
-    // WebRTC race condition fix: Queue candidate if remote description is absent
-    if (!pc.remoteDescription || !pc.remoteDescription.type) {
-      if (!this._iceCandidateQueues.has(senderId)) {
-        this._iceCandidateQueues.set(senderId, []);
-      }
-      this._iceCandidateQueues.get(senderId).push(candidate);
-      return;
-    }
-    
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (err) {
-      console.error(`[WebRTCTransport] Failed to add ICE candidate from ${senderId}:`, err);
-    }
-  }
-
-  /**
-   * Drains early ICE candidates queued before the remote SDP was processed.
-   * @param {string} peerId 
-   * @param {RTCPeerConnection} pc 
-   */
-  async _drainIceCandidates(peerId, pc) {
-    const queue = this._iceCandidateQueues.get(peerId);
-    if (queue && queue.length > 0) {
-      console.log(`[WebRTCTransport] Draining ${queue.length} queued ICE candidates for ${peerId}`);
-      for (const candidate of queue) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error(`[WebRTCTransport] Failed to add queued ICE candidate from ${peerId}:`, err);
-        }
-      }
-      this._iceCandidateQueues.delete(peerId);
-    }
-  }
-
-  /**
-   * Remove a peer's connection and data channel securely.
-   * @param {string} peerId 
-   */
-  removePeer(peerId) {
-    const dc = this._dataChannels.get(peerId);
-    if (dc) {
-      dc.onopen = null;
-      dc.onclose = null;
-      dc.onmessage = null;
-      dc.onerror = null;
-      dc.close();
-      this._dataChannels.delete(peerId);
-    }
-    
-    const pc = this._peerConnections.get(peerId);
-    if (pc) {
-      pc.onicecandidate = null;
-      pc.ondatachannel = null;
-      pc.oniceconnectionstatechange = null;
-      pc.onconnectionstatechange = null;
-      pc.close();
-      this._peerConnections.delete(peerId);
-    }
-
-    this._iceCandidateQueues.delete(peerId);
-    
-    console.log(`[WebRTCTransport] Removed peer ${peerId}`);
-    this._evaluateConnectedState();
-  }
-
-  /**
-   * @param {object} message
-   */
-  send(message) {
-    const payload = JSON.stringify(message);
-    let sentCount = 0;
-    
-    for (const [peerId, dc] of this._dataChannels.entries()) {
-      if (dc.readyState === 'open') {
-        try {
-          dc.send(payload);
-          sentCount++;
-        } catch (err) {
-          console.error(`[WebRTCTransport] Failed to send to ${peerId}:`, err);
-        }
-      }
-    }
-    
-    if (sentCount === 0) {
-      console.warn('[WebRTCTransport] send() called but no data channels are open');
-    }
-  }
-
-  /**
-   * @param {Function} callback
-   */
-  onMessage(callback) {
-    this._messageCallback = callback;
-  }
-
-  /**
-   * Returns true if we have AT LEAST ONE open data channel.
-   * ConnectionManager will enforce if we have ENOUGH channels.
-   * @returns {boolean}
-   */
-  isConnected() {
-    return this._connected;
-  }
-  
-  /**
-   * Return number of open data channels.
-   * @returns {number}
-   */
-  getOpenChannelCount() {
-    let count = 0;
-    for (const dc of this._dataChannels.values()) {
-      if (dc.readyState === 'open') count++;
-    }
-    return count;
-  }
-
-  /**
-   * @returns {Promise<void>}
-   */
-  async disconnect() {
-    console.log('[WebRTCTransport] Disconnecting all peers');
-    for (const peerId of this._peerConnections.keys()) {
-      this.removePeer(peerId);
-    }
-    this._connected = false;
-  }
-
-  /**
-   * @param {string} peerId 
-   * @returns {RTCPeerConnection}
-   */
-  _createPeerConnection(peerId) {
-    const pc = new RTCPeerConnection({ iceServers: this._iceServers });
-    this._peerConnections.set(peerId, pc);
-    
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this._sendSignaling('ICE_CANDIDATE', {
-          targetPeerId: peerId,
-          candidate: event.candidate
-        });
-      }
-    };
-    
-    pc.ondatachannel = (event) => {
-      console.log(`[WebRTCTransport] Received incoming DataChannel from ${peerId}`);
-      this._setupDataChannel(peerId, event.channel);
-    };
-    
-    // Monitor ICE connection state
-    pc.oniceconnectionstatechange = () => {
-      console.log(`[WebRTCTransport] ICE state for ${peerId}: ${pc.iceConnectionState}`);
-      if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
-        this.removePeer(peerId);
-      }
-    };
-
-    // Monitor holistic Connection state (modern standard)
-    pc.onconnectionstatechange = () => {
-      console.log(`[WebRTCTransport] Connection state for ${peerId}: ${pc.connectionState}`);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        this.removePeer(peerId);
-      }
-    };
-    
-    return pc;
-  }
-
-  /**
-   * @param {string} peerId 
-   * @param {RTCDataChannel} dc 
-   */
-  _setupDataChannel(peerId, dc) {
-    this._dataChannels.set(peerId, dc);
-    
-    dc.onopen = () => {
-      console.log(`[WebRTCTransport] DataChannel open for ${peerId}`);
-      this._evaluateConnectedState();
-    };
-    
-    dc.onclose = () => {
-      console.log(`[WebRTCTransport] DataChannel closed for ${peerId}`);
-      this.removePeer(peerId);
-    };
-
-    dc.onerror = (error) => {
-      console.error(`[WebRTCTransport] DataChannel error for ${peerId}:`, error);
-    };
-    
-    dc.onmessage = (event) => {
-      if (this._messageCallback) {
-        try {
-          const message = JSON.parse(event.data);
-          this._messageCallback(message);
-        } catch (err) {
-          console.error(`[WebRTCTransport] Failed to parse message from ${peerId}:`, err);
-        }
-      }
-    };
-  }
-  
-  _evaluateConnectedState() {
-    const prev = this._connected;
-    this._connected = this.getOpenChannelCount() > 0;
-    if (prev !== this._connected && this._onChannelStateChangeCallback) {
-      this._onChannelStateChangeCallback();
-    }
-  }
-
-  /**
-   * Register a callback for DataChannel connectivity changes.
-   * Used by ConnectionManager to trigger transport evaluation.
+   * Register a callback for DataChannel connectivity changes, so the manager
+   * can re-evaluate which transport should be active.
    * @param {Function} callback
    */
   onChannelStateChange(callback) {
@@ -399,20 +187,291 @@ export class WebRTCTransport extends Transport {
   }
 
   /**
-   * @param {string} type 
-   * @param {object} payload 
+   * Reconcile connections against the room's authoritative peer list.
+   *
+   * Passing the whole list rather than add/remove deltas means a dropped JOIN,
+   * a missed LEAVE, or a service-worker restart cannot leave the mesh
+   * permanently inconsistent — the next ROOM_STATE repairs it.
+   *
+   * @param {string[]} peerIds - all peers in the room, including this one
+   * @returns {Promise<void>}
    */
-  _sendSignaling(type, payload) {
-    if (this._signalingCallback) {
-      this._signalingCallback({
-        type,
-        roomId: this._roomId,
-        senderId: this._localPeerId,
-        lamportClock: 0, // Structural messaging bypassing application lamport logic
-        payload
+  async syncPeers(peerIds) {
+    if (!this._roomId) return;
+    try {
+      const response = await this._callOffscreen({ op: 'SYNC_PEERS', peerIds });
+      if (response && typeof response.openChannels === 'number') {
+        this._updateOpenChannels(response.openChannels);
+      }
+    } catch (err) {
+      console.debug('[WebRTCTransport] syncPeers failed:', err);
+    }
+  }
+
+  /**
+   * @param {string} peerId
+   * @returns {Promise<void>}
+   */
+  async removePeer(peerId) {
+    if (!peerId) return;
+    try {
+      await this._callOffscreen({ op: 'REMOVE_PEER', peerId });
+    } catch (err) {
+      console.debug('[WebRTCTransport] removePeer failed:', err);
+    }
+  }
+
+  /**
+   * @param {string} senderId
+   * @param {RTCSessionDescriptionInit} sdp
+   * @returns {Promise<void>}
+   */
+  async handleOffer(senderId, sdp) {
+    await this._forwardSignaling({ op: 'HANDLE_OFFER', peerId: senderId, sdp });
+  }
+
+  /**
+   * @param {string} senderId
+   * @param {RTCSessionDescriptionInit} sdp
+   * @returns {Promise<void>}
+   */
+  async handleAnswer(senderId, sdp) {
+    await this._forwardSignaling({ op: 'HANDLE_ANSWER', peerId: senderId, sdp });
+  }
+
+  /**
+   * @param {string} senderId
+   * @param {RTCIceCandidateInit} candidate
+   * @returns {Promise<void>}
+   */
+  async handleIceCandidate(senderId, candidate) {
+    await this._forwardSignaling({ op: 'HANDLE_ICE', peerId: senderId, candidate });
+  }
+
+  // ── Diagnostics ───────────────────────────────────────────────
+
+  /** @returns {number} */
+  getOpenChannelCount() {
+    return this._openChannels;
+  }
+
+  /**
+   * Transport-level RTT per peer, straight from the succeeded ICE candidate
+   * pair. More accurate than an application-level PING/PONG, which also
+   * absorbs service-worker wake-up and message-passing overhead.
+   *
+   * @returns {Promise<{peerId: string, rttMs: number}[]>}
+   */
+  async getRttSamples() {
+    try {
+      const response = await this._callOffscreen({ op: 'GET_RTT' });
+      return (response && response.samples) || [];
+    } catch {
+      return [];
+    }
+  }
+
+  // ── Offscreen document plumbing ───────────────────────────────
+
+  /**
+   * Route a message from the offscreen document into the Transport interface.
+   * @private
+   */
+  _handleOffscreenMessage(message, _sender, _sendResponse) {
+    if (!message || message.target !== WORKER_TARGET) return false;
+
+    switch (message.event) {
+      case 'SIGNALING': {
+        if (!this._signalingCallback) {
+          console.warn('[WebRTCTransport] No signaling callback registered');
+          break;
+        }
+        this._signalingCallback({
+          type: message.signalType,
+          roomId: this._roomId,
+          senderId: this._localPeerId,
+          // Structural messages sit outside the application Lamport ordering.
+          lamportClock: 0,
+          payload: {
+            targetPeerId: message.targetPeerId,
+            ...message.body,
+          },
+        });
+        break;
+      }
+
+      case 'MESSAGE':
+        if (this._messageCallback) this._messageCallback(message.message);
+        break;
+
+      case 'CHANNEL_STATE':
+        this._updateOpenChannels(message.openChannels);
+        break;
+
+      default:
+        break;
+    }
+
+    return false; // No response expected.
+  }
+
+  /**
+   * @param {number} count
+   * @private
+   */
+  _updateOpenChannels(count) {
+    const previous = this._openChannels;
+    this._openChannels = count;
+
+    if (previous !== count && this._onChannelStateChangeCallback) {
+      this._onChannelStateChangeCallback();
+    }
+  }
+
+  /**
+   * Send an op to the offscreen document, starting it first if needed.
+   * @param {object} payload
+   * @returns {Promise<object>}
+   * @private
+   */
+  async _callOffscreen(payload) {
+    await this._ensureOffscreenDocument();
+
+    // Deliver the deferred INIT before anything that depends on it. Held until
+    // it succeeds, so a transient failure cannot leave the document negotiating
+    // without a local peer ID.
+    if (this._pendingInit) {
+      const init = this._pendingInit;
+      await chrome.runtime.sendMessage({ target: OFFSCREEN_TARGET, ...init });
+      this._pendingInit = null;
+    }
+
+    return chrome.runtime.sendMessage({ target: OFFSCREEN_TARGET, ...payload });
+  }
+
+  /**
+   * Forward a signaling op, tolerating the case where no offscreen document
+   * exists yet (a peer can offer before this side finished setting up).
+   * @param {object} payload
+   * @private
+   */
+  async _forwardSignaling(payload) {
+    try {
+      await this._callOffscreen(payload);
+    } catch (err) {
+      console.debug(`[WebRTCTransport] ${payload.op} failed:`, err);
+    }
+  }
+
+  /**
+   * Create the offscreen document if it is not already running.
+   *
+   * Chrome permits exactly one offscreen document per extension, and a second
+   * createDocument call rejects. Concurrent callers therefore share a single
+   * in-flight promise.
+   *
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _ensureOffscreenDocument() {
+    if (await this._hasOffscreenDocument()) return;
+
+    if (this._creatingOffscreen) {
+      await this._creatingOffscreen;
+      return;
+    }
+
+    this._creatingOffscreen = chrome.offscreen
+      .createDocument({
+        url: OFFSCREEN_PATH,
+        reasons: ['WEB_RTC'],
+        justification:
+          'Host RTCPeerConnection and RTCDataChannel for peer-to-peer playback ' +
+          'sync; WebRTC is not available in an MV3 service worker.',
+      })
+      .catch((err) => {
+        // A racing creation elsewhere already produced the document.
+        if (String(err && err.message).includes('Only a single offscreen')) return;
+        throw err;
+      })
+      .finally(() => {
+        this._creatingOffscreen = null;
       });
-    } else {
-      console.warn('[WebRTCTransport] No signaling callback registered');
+
+    await this._creatingOffscreen;
+  }
+
+  /**
+   * @returns {Promise<boolean>}
+   * @private
+   */
+  async _hasOffscreenDocument() {
+    try {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ['OFFSCREEN_DOCUMENT'],
+        documentUrls: [chrome.runtime.getURL(OFFSCREEN_PATH)],
+      });
+      return contexts.length > 0;
+    } catch {
+      // getContexts needs Chrome 116. Report absence and let createDocument's
+      // "only a single offscreen document" rejection be the real guard.
+      return false;
+    }
+  }
+
+  /**
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _closeOffscreenDocument() {
+    if (!(await this._hasOffscreenDocument())) return;
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch (err) {
+      console.debug('[WebRTCTransport] closeDocument failed:', err);
+    }
+  }
+
+  // ── ICE server provisioning ───────────────────────────────────
+
+  /**
+   * Fetch STUN and (if the server has TURN configured) short-lived TURN
+   * credentials.
+   *
+   * STUN alone only suffices when a direct path can form. Symmetric NAT and
+   * carrier-grade NAT — most mobile networks — need a TURN relay, so without
+   * one those peers silently never connect and the room falls back to the
+   * WebSocket relay forever.
+   *
+   * @returns {Promise<RTCIceServer[]>}
+   * @private
+   */
+  async _getIceServers() {
+    if (this._iceCache && Date.now() - this._iceCache.fetchedAt < ICE_CACHE_TTL_MS) {
+      return this._iceCache.servers;
+    }
+
+    try {
+      const response = await fetch(ICE_ENDPOINT, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const body = await response.json();
+      if (!Array.isArray(body.iceServers) || body.iceServers.length === 0) {
+        throw new Error('No iceServers in response');
+      }
+
+      this._iceCache = { servers: body.iceServers, fetchedAt: Date.now() };
+      console.log(
+        `[WebRTCTransport] Got ${body.iceServers.length} ICE servers ` +
+        `(TURN ${body.turn ? 'available' : 'unavailable'})`
+      );
+      return body.iceServers;
+    } catch (err) {
+      console.warn(
+        '[WebRTCTransport] ICE fetch failed, using STUN-only fallback:',
+        err.message
+      );
+      return FALLBACK_ICE_SERVERS;
     }
   }
 }

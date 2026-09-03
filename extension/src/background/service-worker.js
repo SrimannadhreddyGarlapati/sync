@@ -35,7 +35,29 @@ async function getEngine() {
 // All chrome.runtime.onMessage listeners MUST be registered
 // synchronously at the top level of the service worker.
 
+/**
+ * Messages that belong to other listeners in this worker.
+ *
+ * WebRTCTransport and the offscreen document exchange messages over the same
+ * chrome.runtime bus this router listens on. Without this filter every SDP and
+ * ICE message would fall through to the action switch below and be logged as
+ * an unknown action, and the router would also answer messages it does not own,
+ * racing the real handler's sendResponse.
+ *
+ * `UPDATE_STATUS` is outbound-only — a broadcast to the popup and overlay that
+ * this worker emits and must not try to handle.
+ */
+function isForeignMessage(message) {
+  if (!message) return true;
+  if (message.target === 'synctube-offscreen') return true;
+  if (message.target === 'synctube-worker') return true;
+  if (message.action === 'UPDATE_STATUS') return true;
+  return false;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (isForeignMessage(message)) return false;
+
   // Use async IIFE — return true to keep the message channel open
   (async () => {
     try {
@@ -99,34 +121,10 @@ async function handleMessage(eng, message, sender) {
     }
 
     // ── Force Sync (from popup) ──
-    // Triggers a full state reconciliation via ROOM_STATE.
-    // This respects isPaused (unlike the old empty FORCE_SYNC command).
+    // Triggers a full state reconciliation via ROOM_STATE. Respects isPaused
+    // (unlike the old empty FORCE_SYNC command).
     case 'FORCE_SYNC': {
-      if (eng.isHost) {
-        // Host: query own tab state and broadcast ROOM_STATE to all peers.
-        const tabs = await chrome.tabs.query({ url: '*://*.youtube.com/*' });
-        
-        for (const tab of tabs) {
-          try {
-            const response = await chrome.tabs.sendMessage(tab.id, { action: 'GET_VIDEO_STATE' });
-            if (response?.success && response?.videoState?.videoId) {
-              eng.sendAction('ROOM_STATE', {
-                videoId: response.videoState.videoId,
-                videoTime: response.videoState.videoTime,
-                isPaused: response.videoState.isPaused,
-              });
-              break; // Stop after successfully querying the first active, responding tab
-            }
-          } catch (err) {
-            // Expected if the tab is loading or the content script isn't fully injected.
-            // Move to the next tab.
-            continue;
-          }
-        }
-      } else {
-        // Joiner: ask the host for current state.
-        eng.sendAction('REQUEST_STATE', {});
-      }
+      await eng.forceSync();
       return { success: true };
     }
 

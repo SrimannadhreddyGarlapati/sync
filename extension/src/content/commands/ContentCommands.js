@@ -96,13 +96,31 @@
     }
   }
 
+  /**
+   * A routine correction toward the host's position.
+   *
+   * Delegates to adapter.syncTo, which absorbs a small error by briefly
+   * altering playback rate rather than seeking. That distinction is the whole
+   * point of having a separate command from ROOM_STATE: corrections arrive
+   * every couple of seconds, and a visible seek that often is unwatchable.
+   */
+  class ClientDriftCommand extends ClientSyncCommand {
+    execute(adapter) {
+      if (!adapter || typeof adapter.syncTo !== 'function') return;
+      if (typeof this.payload.videoTime !== 'number') return;
+
+      adapter.syncTo(this.payload.videoTime, { isPaused: this.payload.isPaused });
+    }
+  }
+
   window.SyncTube.ClientCommandFactory = class ClientCommandFactory {
     static _registry = new Map([
       ['PLAY', ClientPlayCommand],
       ['PAUSE', ClientPauseCommand],
       ['SEEK', ClientSeekCommand],
       ['FORCE_SYNC', ClientForceSyncCommand],
-      ['ROOM_STATE', ClientRoomStateCommand]
+      ['ROOM_STATE', ClientRoomStateCommand],
+      ['DRIFT', ClientDriftCommand]
     ]);
 
     static fromWireMessage(message) {
