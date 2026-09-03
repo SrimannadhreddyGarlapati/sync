@@ -33,14 +33,20 @@ export const SyncState = Object.freeze({
 /**
  * Allowed state transitions. Each key maps to the set of states
  * reachable from it. Any transition not listed here is rejected.
+ *
+ * JOINING is reachable from every connected state, not just RECONNECTING: the
+ * WebSocket can drop and be re-established from any of them, and a user can
+ * create or join a different room at any time. Omitting those edges left a
+ * woken service worker unable to leave DISCONNECTED, so the UI reported "Not
+ * connected" while sync was actually running.
  */
 const TRANSITIONS = Object.freeze({
   [SyncState.DISCONNECTED]:  new Set([SyncState.JOINING]),
-  [SyncState.JOINING]:       new Set([SyncState.SYNCING, SyncState.DISCONNECTED]),
-  [SyncState.SYNCING]:       new Set([SyncState.SYNCED, SyncState.DRIFTING, SyncState.DISCONNECTED, SyncState.RECONNECTING]),
-  [SyncState.SYNCED]:        new Set([SyncState.DRIFTING, SyncState.DISCONNECTED, SyncState.RECONNECTING]),
-  [SyncState.DRIFTING]:      new Set([SyncState.SYNCING, SyncState.SYNCED, SyncState.DISCONNECTED, SyncState.RECONNECTING]),
-  [SyncState.RECONNECTING]:  new Set([SyncState.JOINING, SyncState.DISCONNECTED]),
+  [SyncState.JOINING]:       new Set([SyncState.SYNCING, SyncState.RECONNECTING, SyncState.DISCONNECTED]),
+  [SyncState.SYNCING]:       new Set([SyncState.SYNCED, SyncState.DRIFTING, SyncState.JOINING, SyncState.DISCONNECTED, SyncState.RECONNECTING]),
+  [SyncState.SYNCED]:        new Set([SyncState.SYNCING, SyncState.DRIFTING, SyncState.JOINING, SyncState.DISCONNECTED, SyncState.RECONNECTING]),
+  [SyncState.DRIFTING]:      new Set([SyncState.SYNCING, SyncState.SYNCED, SyncState.JOINING, SyncState.DISCONNECTED, SyncState.RECONNECTING]),
+  [SyncState.RECONNECTING]:  new Set([SyncState.JOINING, SyncState.SYNCING, SyncState.SYNCED, SyncState.DISCONNECTED]),
 });
 
 export class SyncStateMachine {

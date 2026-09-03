@@ -136,7 +136,16 @@ window.SyncTube.OverlayUI = class OverlayUI {
     // Use DOM properties instead of innerHTML to prevent XSS vulnerabilities
     this._badgeDot.style.background = stateColors[status.state] || stateColors.DISCONNECTED;
     this._badgeText.textContent = status.roomId;
-    
+
+    // Surface the link on hover. Which transport won and how far away the host
+    // is are otherwise invisible, which makes a sync problem hard to place.
+    const parts = [status.roomId, status.state];
+    if (status.transport && status.transport !== 'none') {
+      parts.push(status.transport === 'WebRTC' ? 'P2P' : 'relay');
+    }
+    if (status.rttMs > 0) parts.push(`${status.rttMs}ms`);
+    this._badge.title = `SyncTube · ${parts.join(' · ')}`;
+
     this._badge.style.display = 'flex';
   }
 

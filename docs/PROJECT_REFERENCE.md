@@ -41,6 +41,10 @@ graph TD
             WST["WebSocketTransport"]
             RTC["WebRTCTransport"]
         end
+        subgraph "Offscreen Document (Singleton)"
+            OFF["offscreen.js"]
+            PC["RTCPeerConnection + DataChannel"]
+        end
         POP["popup.js"]
     end
     subgraph "FastAPI Server"
@@ -48,14 +52,24 @@ graph TD
         CMG["ConnectionManager (Python)"]
         RM["Room"]
         PR["Peer"]
+        TURN["turn.py"]
     end
 
     CS <-->|"chrome.runtime IPC"| SW
     POP <-->|"chrome.runtime IPC"| SW
     SE --> CM --> WST <-->|"WebSocket"| SIG
-    CM --> RTC <-->|"WebRTC DataChannel"| RTC2["Other Peer's RTC"]
+    CM --> RTC <-->|"chrome.runtime IPC"| OFF --> PC
+    PC <-->|"WebRTC DataChannel"| PC2["Other Peer's DataChannel"]
+    RTC -->|"GET /turn-credentials"| TURN
     SIG --> CMG --> RM --> PR
 ```
+
+**Why the offscreen document exists.** WebRTC's interfaces are declared
+`[Exposed=Window]`, so `new RTCPeerConnection()` inside an MV3 service worker
+throws `ReferenceError` — WebRTC simply cannot run there. An offscreen document
+is a real (invisible) DOM context, so it can hold the peer connections while the
+service worker stays the single owner of signaling and application state. It
+also outlives the worker, so connections survive a worker restart.
 
 ### Process Model (OS Analogy)
 
@@ -105,20 +119,35 @@ Every message between peers follows this envelope:
 ```
 sync/
 ├── server/                              # FastAPI Signaling/Relay Server
-│   ├── main.py                          # App entry point, WebSocket endpoint
-│   ├── requirements.txt                 # fastapi, uvicorn
+│   ├── main.py                          # App entry point, WS endpoint, TURN endpoint
+│   ├── requirements.txt                 # fastapi, uvicorn, httpx, pytest
+│   ├── pytest.ini                       # asyncio test config
+│   ├── tests/                           # 25 tests
+│   │   ├── test_server.py               # Health + TURN endpoint
+│   │   ├── test_room.py                 # Host election, time projection
+│   │   └── test_signaling.py            # Routing, clock validation, lifecycle
 │   └── app/
-│       ├── config.py                    # Config singleton (DEBUG, REDIS_URL)
+│       ├── config.py                    # Config singleton (DEBUG, TURN, origin allowlist)
 │       ├── core/
-│       │   └── signaling.py             # WebSocket handler & message router
+│       │   ├── signaling.py             # WebSocket handler & message router
+│       │   └── turn.py                  # ICE server provisioning (Cloudflare TURN)
 │       ├── managers/
-│       │   └── connection_manager.py    # Room/peer lifecycle, broadcast
+│       │   └── connection_manager.py    # Room/peer lifecycle, broadcast, stale reaper
 │       └── models/
 │           ├── room.py                  # Room model with host election
 │           └── peer.py                  # Peer model (WebSocket wrapper)
 │
 └── extension/                           # Chrome Extension (MV3)
     ├── manifest.json                    # MV3 manifest
+    ├── package.json                     # npm test (node:test, no dependencies)
+    ├── tests/                           # 121 tests
+    │   ├── helpers/                     # chrome, WebRTC and <video> stubs
+    │   ├── clock-sync.test.js           # Latency compensation
+    │   ├── connection-manager.test.js   # Transport selection
+    │   ├── sync-engine.test.js          # PONG routing, compensation, host election
+    │   ├── drift-nudge.test.js          # Playback-rate convergence
+    │   ├── offscreen-webrtc.test.js     # Negotiation, ICE queueing, mesh diffing
+    │   └── websocket-reconnect.test.js  # Backoff and reconnect notification
     └── src/
         ├── background/                  # Service Worker (runs in background)
         │   ├── service-worker.js        # Entry point, IPC router
@@ -132,6 +161,7 @@ sync/
         │   │   ├── PlayCommand.js
         │   │   ├── PauseCommand.js
         │   │   ├── SeekCommand.js
+        │   │   ├── DriftCommand.js      # Rate-nudged drift correction
         │   │   ├── ForceSyncCommand.js
         │   │   ├── RoomStateCommand.js
         │   │   └── RequestStateCommand.js
@@ -140,7 +170,11 @@ sync/
         │   └── transports/              # Strategy Pattern implementations
         │       ├── Transport.js         # Abstract base
         │       ├── WebSocketTransport.js # Relay via server
-        │       └── WebRTCTransport.js   # P2P DataChannel
+        │       └── WebRTCTransport.js   # Proxy to the offscreen WebRTC host
+        │
+        ├── offscreen/                   # WebRTC host (DOM context)
+        │   ├── offscreen.html           # Invisible page, never shown
+        │   └── offscreen.js             # Owns RTCPeerConnection + DataChannel
         │
         ├── content/                     # Content Script (runs per YouTube tab)
         │   ├── content-script.js        # Entry point, video detection, IPC
@@ -170,8 +204,16 @@ Entry point. Creates the FastAPI app, configures CORS, and defines endpoints.
 | Symbol | Type | Purpose |
 |---|---|---|
 | `app` | `FastAPI` | Application instance |
+| `lifespan(app)` | async context manager | Runs the stale-peer reaper for the process lifetime; warns if the origin allowlist or TURN is unconfigured |
 | `root()` | `GET /` | Health check → `{"message": "...running"}` |
-| `websocket_endpoint(ws, room_id, peer_id)` | `WS /ws/{room_id}/{peer_id}` | WebSocket endpoint. Delegates to `handle_websocket()` |
+| `turn_credentials()` | `GET /turn-credentials` | Short-lived `iceServers` array for `RTCPeerConnection` |
+| `_origin_allowed(origin)` | `(str\|None) → bool` | Checks the WebSocket handshake `Origin` against `ALLOWED_EXTENSION_IDS` |
+| `websocket_endpoint(ws, room_id, peer_id)` | `WS /ws/{room_id}/{peer_id}` | Rejects disallowed origins, then delegates to `handle_websocket()` |
+
+CORS uses `allow_credentials=False` alongside the wildcard origin. The Fetch
+spec forbids `Access-Control-Allow-Origin: *` on a credentialed request, so
+pairing the two silently breaks the very requests it appears to permit. No
+endpoint here uses cookies or HTTP auth.
 
 ---
 
@@ -180,8 +222,13 @@ Entry point. Creates the FastAPI app, configures CORS, and defines endpoints.
 | Symbol | Type | Purpose |
 |---|---|---|
 | `Config` | `class` | Settings container |
-| `Config.DEBUG` | `bool` | `env:DEBUG` (default `true`) → verbose logging |
+| `Config.DEBUG` | `bool` | `env:DEBUG` (default `false`) → verbose logging |
 | `Config.REDIS_URL` | `str\|None` | `env:REDIS_URL` → future horizontal scaling |
+| `Config.ALLOWED_EXTENSION_IDS` | `list[str]` | `env:ALLOWED_EXTENSION_IDS` → WebSocket origin allowlist. Empty accepts any origin and logs a warning |
+| `Config.CLOUDFLARE_TURN_KEY_ID` | `str\|None` | TURN key ID; unset degrades `/turn-credentials` to STUN-only |
+| `Config.CLOUDFLARE_TURN_API_TOKEN` | `str\|None` | TURN API token |
+| `Config.TURN_CREDENTIAL_TTL_S` | `int` | Lifetime of a minted credential (default `3600`) |
+| `Config.turn_enabled` | property | Whether both TURN settings are present |
 | `config` | `Config` | Singleton instance |
 
 ---
@@ -272,7 +319,7 @@ Central orchestrator. Coordinates all subsystems.
 | `joinRoom` | `async (roomId: string) → {roomId, peerId}` | Uppercases code, sets `_isHost=false`, transitions to JOINING, connects transport |
 | `ensureConnection` | `async () → void` | Re-connects transport if SW woke from sleep with a stored `_roomId` |
 | `leaveRoom` | `async () → void` | Stops heartbeat, disconnects transport, resets state machine, clears storage |
-| `handleSyncMessage` | `(wireMessage: object) → void` | Updates Lamport clock. Routes: HOST_CHANGE → update host flag + broadcast ROOM_STATE. PING → reply PONG. PONG → record RTT. HEARTBEAT → drift check. Others → deserialize via CommandFactory → emit `command:received` |
+| `handleSyncMessage` | `(wireMessage: object) → void` | Updates Lamport clock. Routes: HOST_CHANGE / ROOM_STATE → adopt host. PING → host replies PONG **addressed to the asker**. PONG → record RTT, but only if `targetPeerId` names us. HEARTBEAT → drift check. Others → deserialize via CommandFactory → emit `command:received` |
 | `buildMessage` | `(type, payload) → object` | Constructs wire protocol envelope with incremented `lamportClock` and `originTimestamp` |
 | `sendAction` | `(type, payload) → void` | Builds message → sends via `connectionManager.send()` |
 | `handlePause` | `(userId, videoTime) → void` | Convenience: `sendAction('PAUSE', {videoTime})` |
@@ -281,7 +328,7 @@ Central orchestrator. Coordinates all subsystems.
 | `disconnect` | `() → void` | Calls `leaveRoom()` |
 | `_broadcastStatusUpdate` | `() → void` | Sends `UPDATE_STATUS` IPC to popup (silently fails if popup closed) |
 | `_setupEventHandlers` | `() → void` | Wires `connection:established` → SYNCING + REQUEST_STATE (if joiner). `connection:closed` → reset. `command:received` → routes to YouTube tabs via `APPLY_COMMAND` IPC |
-| `_startHeartbeat` | `() → void` | Every 5s: Host queries tab → broadcasts HEARTBEAT. Non-host sends PING. Disconnects host if 0 YouTube tabs |
+| `_startHeartbeat` | `() → void` | Every 2s: host queries its cached tab → broadcasts HEARTBEAT; non-host sends PING every 6s and samples transport RTT. Disconnects host if 0 YouTube tabs. `chrome.storage` writes throttled to 10s |
 | `_stopHeartbeat` | `() → void` | Clears the heartbeat interval |
 | `_broadcastRoomState` | `() → void` | Queries YouTube tabs for video state → sends `ROOM_STATE` to peers (first valid watch tab only) |
 | `_persistState` | `async () → void` | Writes `{peerId, roomId, isHost, lamportClock}` to `chrome.storage.session` |
@@ -348,12 +395,26 @@ Hybrid transport strategy. Threshold: `P2P_THRESHOLD = 5` users.
 
 Cristian's Algorithm for latency compensation. Keeps up to 10 RTT samples.
 
+Delay is derived from round trips, never from subtracting timestamps:
+`localReceiveTime - originTimestamp` is one-way delay *plus* the offset between
+two independent machine clocks, which routinely disagree by seconds and can make
+that figure negative. Timing a round trip against a single clock cancels the
+offset out.
+
 | Method | Signature | I/O |
 |---|---|---|
-| `estimateDelay` | `(originTimestamp: number) → number` | Naive one-way delay estimate: `(now - origin) / 2`. **Returns** delay in ms |
-| `compensateTime` | `(videoTime: number, originTimestamp: number) → number` | If RTT samples exist → uses averaged delay. Otherwise → naive fallback. **Returns** compensated video time in seconds |
-| `recordRTT` | `(rttMs: number) → void` | Adds RTT sample, trims to 10, recalculates `_estimatedDelay = avg(RTT)/2` |
+| `estimateDelay` | `(originTimestamp: number) → number` | Bootstrap-only estimate `(now - origin) / 2`, clamped to `[0, 2000]`. Contaminated by clock offset, so used only before the first sample arrives. **Returns** delay in ms |
+| `compensateTime` | `(videoTime: number, originTimestamp: number, isPlaying = true) → number` | Advances the position by the one-way delay, capped at 2000 ms. Returns `videoTime` unchanged when `isPlaying` is false, since a paused position is not advancing. **Returns** seconds |
+| `recordRTT` | `(rttMs: number) → void` | Adds a sample (rejecting `< 0` or `> 5000`), trims to 10, recalculates `_estimatedDelay = median(RTT) / 2` |
+| `reset` | `() → void` | Discards all samples. Called on a transport switch, since P2P RTT and relay RTT are unrelated |
 | `estimatedDelay` | getter | Current one-way delay in ms |
+| `rttMs` | getter | Median round-trip time in ms, for display |
+| `sampleCount` | getter | Samples backing the current estimate |
+
+**Median, not mean.** RTT distributions are heavily right-skewed: most samples
+cluster near the true path delay, with occasional multiples from a scheduling
+hiccup or a service-worker wake-up. A mean chases those spikes and stays
+inflated for the next ten samples.
 
 ---
 
@@ -464,26 +525,66 @@ Connects to `ws://127.0.0.1:8000/ws/{roomId}/{peerId}`. Reconnection: exponentia
 
 #### [`WebRTCTransport.js`](file:///c:/Users/hp/Desktop/Projects/sync/extension/src/background/transports/WebRTCTransport.js)
 
-P2P mesh via RTCDataChannel. STUN servers: `stun.l.google.com:19302`.
+P2P mesh via RTCDataChannel.
+
+**This class holds no peer connections.** WebRTC's interfaces are declared
+`[Exposed=Window]`, so `new RTCPeerConnection()` inside an MV3 service worker
+throws `ReferenceError`. The connections live in an offscreen document
+(`src/offscreen/`) and this class is the worker's proxy to it: it owns that
+document's lifecycle, forwards ops, and turns the events coming back into the
+`Transport` interface. Because the offscreen document outlives the worker, peer
+connections survive a worker restart.
+
+ICE servers are fetched from `GET /turn-credentials`, falling back to
+`stun.l.google.com:19302` if that request fails.
 
 | Method | Signature | I/O |
 |---|---|---|
-| `connect` | `async (roomId, peerId) → void` | Stores IDs (connections are demand-driven) |
+| `connect` | `async (roomId, peerId) → void` | Ensures the offscreen document exists, fetches ICE servers, sends `INIT` (which wipes any mesh left from a previous worker) |
 | `onSignaling` | `(callback) → void` | Register outbound signaling callback (routed through WS) |
-| `hasPeerConnection` | `(peerId) → boolean` | Check if connection exists to peer |
-| `connectToPeer` | `async (peerId) → void` | Creates `RTCPeerConnection`, creates DataChannel (`ordered:true, maxRetransmits:3`), creates & sends SDP offer |
-| `handleOffer` | `async (senderId, sdp) → void` | Creates peer connection, sets remote description, creates & sends SDP answer |
-| `handleAnswer` | `async (senderId, sdp) → void` | Sets remote description on existing connection |
-| `handleIceCandidate` | `async (senderId, candidate) → void` | Adds ICE candidate to peer connection |
-| `removePeer` | `(peerId) → void` | Closes DataChannel + PeerConnection, re-evaluates connected state |
-| `send` | `(message) → void` | `JSON.stringify` → sends to ALL open DataChannels |
+| `syncPeers` | `async (peerIds: string[]) → void` | Reconciles connections against the room's **whole** peer list, so a dropped JOIN or worker restart cannot leave the mesh permanently wrong |
+| `removePeer` | `async (peerId) → void` | Closes that peer's connection |
+| `handleOffer` | `async (senderId, sdp) → void` | Forwards to the offscreen document |
+| `handleAnswer` | `async (senderId, sdp) → void` | Forwards to the offscreen document |
+| `handleIceCandidate` | `async (senderId, candidate) → void` | Forwards to the offscreen document |
+| `send` | `(message) → void` | Broadcasts to all open DataChannels |
 | `isConnected` | `() → boolean` | `true` if ≥ 1 open DataChannel |
-| `getOpenChannelCount` | `() → number` | Count of DataChannels with `readyState === 'open'` |
-| `disconnect` | `async () → void` | Removes all peers |
+| `getOpenChannelCount` | `() → number` | Open DataChannels, as last reported by the offscreen document |
+| `getRttSamples` | `async () → {peerId, rttMs}[]` | Per-peer RTT from the succeeded ICE candidate pair (`getStats()`) |
+| `disconnect` | `async () → void` | Tears down the mesh and closes the offscreen document |
 | `onChannelStateChange` | `(callback) → void` | Register callback for connectivity changes |
-| `_createPeerConnection` | `(peerId) → RTCPeerConnection` | Creates PC with ICE handlers, data channel receiver, connection state monitor |
-| `_setupDataChannel` | `(peerId, dc) → void` | Wires open/close/message handlers |
-| `_sendSignaling` | `(type, payload) → void` | Sends signaling message via registered callback |
+| `_ensureOffscreenDocument` | `async () → void` | Creates the document if absent. Chrome permits exactly one, so concurrent callers share one in-flight promise |
+| `_getIceServers` | `async () → RTCIceServer[]` | Fetches from `/turn-credentials`, cached 30 min, STUN-only on failure |
+| `_handleOffscreenMessage` | `(message) → false` | Routes `SIGNALING` / `MESSAGE` / `CHANNEL_STATE` events into the Transport interface |
+
+#### `src/offscreen/offscreen.js`
+
+Holds the actual `RTCPeerConnection` and `RTCDataChannel` objects.
+
+**Glare-free negotiation.** Both peers learn about each other at the same
+moment, so a symmetric "everyone offers" scheme deadlocks. The offerer is chosen
+deterministically instead: the peer whose ID sorts lower initiates and creates
+the single DataChannel. Both sides compute the same role from the same two IDs,
+so exactly one offer is ever made. Perfect-negotiation rollback stays underneath
+as a backstop for a teardown racing an in-flight offer.
+
+**Channel config is `{ ordered: true }` with no retransmit cap** — fully
+reliable. Capping retransmits makes the channel only *partially* reliable, and a
+dropped `PLAY` that never retransmits leaves that peer permanently out of sync.
+
+**`disconnected` is not `failed`.** A brief ICE `disconnected` is usually a
+transient blip that recovers on its own; only a genuine `failed` triggers
+`restartIce()`, and only on the offerer, which owns renegotiation.
+
+| Op (worker → offscreen) | Effect |
+|---|---|
+| `INIT` | Reset all connections, adopt peer ID and ICE servers |
+| `SYNC_PEERS` | Diff the connection set against the room's peer list |
+| `REMOVE_PEER` | Close one connection |
+| `HANDLE_OFFER` / `HANDLE_ANSWER` / `HANDLE_ICE` | Apply inbound signaling; ICE arriving before the remote SDP is queued and drained |
+| `SEND` | Broadcast to open channels; returns how many received it |
+| `GET_STATE` / `GET_RTT` | Diagnostics |
+| `TEARDOWN` | Close everything |
 
 ---
 
@@ -557,7 +658,7 @@ Extends `VideoAdapter`. Handles YouTube-specific quirks.
 
 | Layer | Mechanism | Purpose |
 |---|---|---|
-| Layer 1 — State Checks | `play()` skips if `!video.paused`; `pause()` skips if `video.paused`; `seek()` skips if `|currentTime - target| < 0.5s` | If state already matches, no DOM call → no event → no echo |
+| Layer 1 — State Checks | `play()` skips if `!video.paused`; `pause()` skips if `video.paused`; `seek()` skips if `|currentTime - target| < 0.15s` | If state already matches, no DOM call → no event → no echo |
 | Layer 2 — Consumed Flags | `_remotePlayPending` / `_remotePausePending` / `_isProgrammaticSeek` set before DOM call, consumed by event handler | Catches async events for state-changing commands |
 | Page-load Window | `_suppressUntil = Date.now() + 2000` | Suppresses YouTube's spurious load events for first 2 seconds |
 
@@ -566,7 +667,7 @@ Extends `VideoAdapter`. Handles YouTube-specific quirks.
 | `attach(videoElement)` | Sets up all event listeners, video ID polling (1s interval), MutationObserver for `.ad-showing` |
 | `play()` | Guard: ad playing? Already playing? → skip. Sets `_remotePlayPending=true`, calls `video.play()` |
 | `pause()` | Guard: ad playing? Already paused? → skip. Sets `_remotePausePending=true`, calls `video.pause()` |
-| `seek(time)` | Clamps to `[0, duration]`. Guard: ad? Within 0.5s? → skip. Sets `_isProgrammaticSeek=true` |
+| `seek(time)` | Clamps to `[0, duration]`. Guard: ad? Within 0.15s? → skip. Sets `_isProgrammaticSeek=true` |
 | `getVideoId()` | Parses URL: `/watch?v=`, `/shorts/`, `/embed/` patterns |
 | `isReady()` | `video.readyState >= 2` (HAVE_CURRENT_DATA) |
 | `applyRemoteCommand(cmd)` | Calls `cmd.execute(this)` — echo suppression handled by play/pause/seek internally |

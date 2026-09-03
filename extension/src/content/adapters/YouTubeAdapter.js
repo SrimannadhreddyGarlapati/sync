@@ -31,6 +31,28 @@
 
 window.SyncTube = window.SyncTube || {};
 
+/**
+ * Positions within this distance are treated as identical. Must be tighter
+ * than the engine's drift tolerance, or corrections inside the gap are
+ * discarded here while the engine keeps reissuing them.
+ */
+const SEEK_DEAD_ZONE_S = 0.15;
+
+/** Drift at or above this is corrected by seeking; below it, by rate nudging. */
+const HARD_SEEK_THRESHOLD_S = 1.5;
+
+/** Wall-clock seconds a nudge aims to take. Longer is gentler. */
+const NUDGE_TARGET_WINDOW_S = 8;
+
+/** Largest speed deviation used. ±6% sits below the threshold of perception. */
+const MAX_RATE_DELTA = 0.06;
+
+/** Below this the rate change is not worth making. */
+const MIN_RATE_DELTA = 0.005;
+
+/** Hard cap on a single nudge, so a stalled correction cannot run forever. */
+const MAX_NUDGE_DURATION_MS = 12000;
+
 window.SyncTube.YouTubeAdapter = class YouTubeAdapter extends window.SyncTube.VideoAdapter {
   constructor() {
     super();
@@ -102,6 +124,12 @@ window.SyncTube.YouTubeAdapter = class YouTubeAdapter extends window.SyncTube.Vi
     this._isInterrupted = false;
     /** @type {MutationObserver|null} Observer for ad detection */
     this._adObserver = null;
+
+    // ── Drift Nudging ─────────────────────────────────────────
+    /** @type {boolean} Whether playbackRate is currently being held off 1.0 */
+    this._isNudging = false;
+    /** @type {number|null} Timer that ends the current nudge */
+    this._nudgeTimer = null;
 
     // ── Command Queuing ───────────────────────────────────────
     /** @type {Array<object>} Queue for remote commands received before video is ready */
@@ -181,12 +209,128 @@ window.SyncTube.YouTubeAdapter = class YouTubeAdapter extends window.SyncTube.Vi
       time = Math.max(0, Math.min(time, duration));
     }
 
-    // Layer 1 Echo Suppression: skip if already within 0.5s of target position
-    if (Math.abs(this._video.currentTime - time) < 0.5) return;
+    // Layer 1 Echo Suppression: skip if we are already essentially there.
+    // The dead zone has to be smaller than the drift tolerance it serves,
+    // otherwise corrections inside the zone are silently discarded and the
+    // engine keeps reissuing a correction that never applies.
+    if (Math.abs(this._video.currentTime - time) < SEEK_DEAD_ZONE_S) return;
 
     // Layer 2 Echo Suppression: mark as programmatic seek
     this._isProgrammaticSeek = true;
     this._video.currentTime = time;
+  }
+
+  /**
+   * Converge on the host's position, absorbing small errors via playback rate.
+   *
+   * See VideoAdapter.syncTo for why rate adjustment beats seeking here.
+   *
+   * @param {number} targetTime - Target position in seconds
+   * @param {object} [options]
+   * @param {boolean} [options.isPaused] - Target play state, if it should change
+   */
+  syncTo(targetTime, options = {}) {
+    if (!this._video || this._isAdPlaying()) return;
+    if (typeof targetTime !== 'number' || !Number.isFinite(targetTime)) return;
+
+    const { isPaused } = options;
+
+    // Fix the play state first: a rate nudge is meaningless on a paused video,
+    // and a video that should be paused wants an exact seek anyway.
+    if (typeof isPaused === 'boolean' && isPaused !== this._video.paused) {
+      if (isPaused) {
+        this.pause();
+        this.seek(targetTime);
+        this._cancelNudge();
+        return;
+      }
+      this.seek(targetTime);
+      this.play();
+      return;
+    }
+
+    if (this._video.paused) {
+      // Nothing is advancing; land exactly on target.
+      this.seek(targetTime);
+      this._cancelNudge();
+      return;
+    }
+
+    const drift = targetTime - this._video.currentTime;
+    const magnitude = Math.abs(drift);
+
+    if (magnitude < SEEK_DEAD_ZONE_S) {
+      this._cancelNudge();
+      return;
+    }
+
+    if (magnitude >= HARD_SEEK_THRESHOLD_S) {
+      // Too far to absorb: rate-correcting this much would either take
+      // uncomfortably long or need an audibly wrong speed.
+      this._cancelNudge();
+      this.seek(targetTime);
+      return;
+    }
+
+    this._nudge(drift);
+  }
+
+  /**
+   * Absorb `drift` seconds of error by running slightly off-speed.
+   *
+   * Rate r for wall-clock duration t closes (r - 1) * t seconds of gap, so the
+   * duration needed is drift / (r - 1). The rate delta is capped at
+   * MAX_RATE_DELTA to stay below the threshold of perception, which means a
+   * larger drift simply takes longer rather than sounding wrong.
+   *
+   * @param {number} drift - Signed seconds to make up; positive means behind
+   * @private
+   */
+  _nudge(drift) {
+    // Respect a deliberate speed choice. Overriding a user watching at 1.5x
+    // would fight them, and restoring to 1.0 afterwards would lose their setting.
+    if (!this._isNudging && Math.abs(this._video.playbackRate - 1) > 0.001) {
+      return;
+    }
+
+    const delta = Math.min(MAX_RATE_DELTA, Math.abs(drift) / NUDGE_TARGET_WINDOW_S);
+    if (delta < MIN_RATE_DELTA) return;
+
+    const rate = drift > 0 ? 1 + delta : 1 - delta;
+    const durationMs = Math.min((Math.abs(drift) / delta) * 1000, MAX_NUDGE_DURATION_MS);
+
+    this._cancelNudge();
+    this._isNudging = true;
+    this._video.playbackRate = rate;
+
+    console.log(
+      `[YouTubeAdapter] Nudging rate to ${rate.toFixed(3)} for ` +
+      `${Math.round(durationMs)}ms to absorb ${drift.toFixed(2)}s`
+    );
+
+    this._nudgeTimer = setTimeout(() => {
+      this._nudgeTimer = null;
+      this._endNudge();
+    }, durationMs);
+  }
+
+  /**
+   * Stop an in-flight nudge and restore normal speed.
+   * @private
+   */
+  _cancelNudge() {
+    if (this._nudgeTimer !== null) {
+      clearTimeout(this._nudgeTimer);
+      this._nudgeTimer = null;
+    }
+    this._endNudge();
+  }
+
+  /** @private */
+  _endNudge() {
+    if (!this._isNudging) return;
+    this._isNudging = false;
+    if (this._video) this._video.playbackRate = 1;
   }
 
   getCurrentTime() {
@@ -268,6 +412,12 @@ window.SyncTube.YouTubeAdapter = class YouTubeAdapter extends window.SyncTube.Vi
 
   destroy() {
     this._attached = false;
+
+    // Restore normal speed before detaching. The <video> element survives
+    // YouTube's SPA navigation, so an in-flight nudge would otherwise leave
+    // the next video playing slightly off-speed with nothing left to fix it.
+    this._cancelNudge();
+
     this._abortController.abort(); // Clears all bound DOM events
 
     if (this._seekDebounceTimer !== null) {
@@ -516,6 +666,8 @@ window.SyncTube.YouTubeAdapter = class YouTubeAdapter extends window.SyncTube.Vi
       isSeeking: this._isSeeking,
       isProgrammaticSeek: this._isProgrammaticSeek,
       isAdPlaying: this._isAdPlaying(),
+      isNudging: this._isNudging,
+      playbackRate: this._video ? this._video.playbackRate : null,
       remotePlayPending: this._remotePlayPending,
       remotePausePending: this._remotePausePending,
       queuedCommands: this._commandQueue.length,

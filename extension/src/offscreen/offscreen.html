@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SyncTube WebRTC Host</title>
+</head>
+<body>
+  <!--
+    This page is never shown to anyone. It exists only because WebRTC is
+    unavailable in an MV3 service worker: RTCPeerConnection is [Exposed=Window]
+    in the WebIDL, so `new RTCPeerConnection()` in the background worker throws
+    ReferenceError. An offscreen document is a real DOM context, so it can hold
+    the peer connections; the service worker drives it over chrome.runtime
+    messaging and stays the single owner of signaling and application state.
+  -->
+  <script src="offscreen.js"></script>
+</body>
+</html>

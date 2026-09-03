@@ -24,6 +24,19 @@ export class SeekCommand extends SyncCommand {
   }
 
   /**
+   * Whether the sender was playing when it seeked.
+   *
+   * Latency compensation needs this: a scrub during playback leaves the sender
+   * still advancing, so the target must be nudged forward by the network delay,
+   * whereas a scrub while paused leaves it exactly where it landed.
+   *
+   * @returns {boolean|undefined}
+   */
+  get isPaused() {
+    return this.payload.isPaused;
+  }
+
+  /**
    * @param {import('../../content/adapters/VideoAdapter.js').VideoAdapter} adapter
    */
   execute(adapter) {
@@ -42,12 +55,16 @@ export class SeekCommand extends SyncCommand {
     const serialized = {
       videoTime: this.payload.videoTime,
     };
-    
+
     // Only include videoId if it's present to save bytes on the wire
     if (this.payload.videoId) {
       serialized.videoId = this.payload.videoId;
     }
-    
+
+    if (typeof this.payload.isPaused === 'boolean') {
+      serialized.isPaused = this.payload.isPaused;
+    }
+
     return serialized;
   }
 }

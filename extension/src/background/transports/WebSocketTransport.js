@@ -15,6 +15,7 @@
  */
 
 import { Transport } from './Transport.js';
+import { buildSocketUrl } from '../config.js';
 
 /** @type {number} Initial reconnect delay in ms */
 const RECONNECT_BASE_MS = 1000;
@@ -36,6 +37,9 @@ export class WebSocketTransport extends Transport {
 
     /** @type {Function|null} Callback when connection drops unexpectedly */
     this._onCloseCallback = null;
+
+    /** @type {Function|null} Callback when a dropped connection is restored */
+    this._onReopenCallback = null;
 
     /** @type {boolean} */
     this._connected = false;
@@ -83,7 +87,7 @@ export class WebSocketTransport extends Transport {
    */
   _doConnect() {
     return new Promise((resolve, reject) => {
-      const url = `wss://sync-l5pk.onrender.com/ws/${this._roomId}/${this._peerId}`;
+      const url = buildSocketUrl(this._roomId, this._peerId);
       console.log(`[WebSocketTransport] Connecting to ${url}...`);
       
       let isResolved = false;
@@ -98,7 +102,17 @@ export class WebSocketTransport extends Transport {
         console.log('[WebSocketTransport] Connected.');
         isResolved = true;
         this._connected = true;
-        this._reconnectAttempts = 0; // Reset on successful connect
+
+        // A reconnect resolves no promise — the original connect() already
+        // settled — so without this notification nothing downstream learns the
+        // session is live again, and the UI stays stuck on "Reconnecting".
+        const wasReconnect = this._reconnectAttempts > 0;
+        this._reconnectAttempts = 0;
+
+        if (wasReconnect && this._onReopenCallback) {
+          this._onReopenCallback();
+        }
+
         resolve();
       };
 
@@ -195,6 +209,14 @@ export class WebSocketTransport extends Transport {
    */
   onClose(callback) {
     this._onCloseCallback = callback;
+  }
+
+  /**
+   * Register a callback for a successful reconnect after an unexpected drop.
+   * @param {Function} callback
+   */
+  onReopen(callback) {
+    this._onReopenCallback = callback;
   }
 
   /**

@@ -24,6 +24,11 @@
   const peerCount = document.getElementById('peerCount');
   const btnForceSync = document.getElementById('btnForceSync');
   const btnLeave = document.getElementById('btnLeave');
+  const transportChip = document.getElementById('transportChip');
+  const latencyChip = document.getElementById('latencyChip');
+
+  /** @type {number|null} Poll timer for link diagnostics while the popup is open */
+  let statusPollId = null;
 
   // ── IPC Helper ──────────────────────────────────────────────
 
@@ -77,18 +82,53 @@
       viewConnected.classList.remove('hidden');
       roomCode.textContent = status.roomId;
       
+      const others = Math.max(0, (status.peerCount || 1) - 1);
+      const company = others === 0
+        ? 'alone'
+        : `with ${others} other${others === 1 ? '' : 's'}`;
+
       if (status.isHost) {
-        peerCount.textContent = '★ You are the Host';
+        peerCount.textContent = `★ Host · ${company}`;
         peerCount.classList.add('host');
       } else {
-        peerCount.textContent = 'Participant';
+        peerCount.textContent = `Participant · ${company}`;
         peerCount.classList.remove('host');
       }
+
+      updateLinkInfo(status);
     } else {
       viewDisconnected.classList.remove('hidden');
       viewConnected.classList.add('hidden');
       inputRoomCode.value = ''; // Clear on disconnect
     }
+  }
+
+  /**
+   * Show which transport is carrying commands and how far away the host is.
+   *
+   * The hybrid transport is the interesting part of this system and is
+   * otherwise completely invisible — without this you cannot tell whether P2P
+   * actually came up or whether the room quietly fell back to the relay.
+   *
+   * @param {object} status
+   */
+  function updateLinkInfo(status) {
+    const transport = status.transport || 'none';
+
+    transportChip.classList.remove('p2p', 'relay');
+
+    if (transport === 'WebRTC') {
+      transportChip.textContent = 'P2P · WebRTC';
+      transportChip.classList.add('p2p');
+    } else if (transport === 'WebSocket') {
+      transportChip.textContent = 'Relay · WebSocket';
+      transportChip.classList.add('relay');
+    } else {
+      transportChip.textContent = 'No transport';
+    }
+
+    const rtt = status.rttMs;
+    latencyChip.textContent = rtt > 0 ? `${rtt} ms RTT` : 'measuring…';
   }
 
   /**
@@ -192,9 +232,8 @@
 
   // ── Initialization ──────────────────────────────────────────
 
-  async function init() {
+  async function refreshStatus() {
     try {
-      // Blueprint: GET_STATUS returns {peerId, roomId, isHost, state, connected}
       const status = await sendMessage('GET_STATUS');
       if (status && status.state) {
         updateUI(status);
@@ -203,6 +242,19 @@
       console.warn('[Popup] Failed to get status. Service Worker may be asleep:', err);
     }
   }
+
+  async function init() {
+    await refreshStatus();
+
+    // RTT and transport change without any state transition to announce them,
+    // so a push-only UI would show a stale reading for as long as the popup
+    // stays open. Polling stops with the popup, so it costs nothing when closed.
+    statusPollId = setInterval(refreshStatus, 2000);
+  }
+
+  window.addEventListener('unload', () => {
+    if (statusPollId !== null) clearInterval(statusPollId);
+  });
 
   init();
 })();
