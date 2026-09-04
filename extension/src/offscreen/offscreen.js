@@ -70,6 +70,21 @@ let iceServers = DEFAULT_ICE_SERVERS;
  */
 const peers = new Map();
 
+/**
+ * Candidates that arrived before their peer entry existed.
+ *
+ * ICE gathering starts as soon as the offerer sets a local description, so its
+ * candidates routinely overtake the SYNC_PEERS or SDP_OFFER that creates the
+ * entry on this side. Dropping them costs real connectivity — the discarded
+ * ones are often the host candidates that would have formed the fastest pair.
+ *
+ * @type {Map<string, RTCIceCandidateInit[]>}
+ */
+const orphanCandidates = new Map();
+
+/** Cap per peer, so a peer that never materialises cannot grow this forever. */
+const MAX_ORPHAN_CANDIDATES = 30;
+
 // ── Outbound messaging ──────────────────────────────────────────
 
 /**
@@ -108,11 +123,30 @@ function reportChannelState() {
 /**
  * True if this peer is the one responsible for sending the offer.
  * Deterministic and symmetric: both sides compute the same result.
+ *
+ * Callers must establish `hasIdentity()` first. With a null localPeerId this
+ * silently returns true for every remote peer, because `String(null)` is
+ * "null" and "n" sorts before "p" — so both sides would offer.
+ *
  * @param {string} remotePeerId
  * @returns {boolean}
  */
 function isInitiator(remotePeerId) {
   return String(localPeerId) < String(remotePeerId);
+}
+
+/**
+ * Whether INIT has run and this document knows who it is.
+ *
+ * Acting without an identity is not a degraded mode, it is a broken one: the
+ * peer can neither exclude itself from the room list nor compute its
+ * offerer/answerer role. Refusing is the only safe response — the worker
+ * re-sends INIT on its next call, and the mesh converges from there.
+ *
+ * @returns {boolean}
+ */
+function hasIdentity() {
+  return typeof localPeerId === 'string' && localPeerId.length > 0;
 }
 
 /** @returns {number} */
@@ -144,13 +178,17 @@ function createPeerEntry(remotePeerId) {
   const entry = {
     pc,
     channel: null,
-    pendingCandidates: [],
+    // Adopt anything ICE delivered before this entry existed. Done here rather
+    // than in addPeer so the offer path, which creates entries directly, gets
+    // them too.
+    pendingCandidates: orphanCandidates.get(remotePeerId) || [],
     makingOffer: false,
     ignoreOffer: false,
     settingRemoteAnswer: false,
     initiator: isInitiator(remotePeerId),
   };
   peers.set(remotePeerId, entry);
+  orphanCandidates.delete(remotePeerId);
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
@@ -256,6 +294,10 @@ function attachChannel(remotePeerId, channel) {
  * @param {string} remotePeerId
  */
 function addPeer(remotePeerId) {
+  if (!hasIdentity()) {
+    console.debug(`${TAG} Refusing to connect to ${remotePeerId} before INIT`);
+    return;
+  }
   if (!remotePeerId || remotePeerId === localPeerId) return;
   if (peers.has(remotePeerId)) return;
 
@@ -298,6 +340,7 @@ function removePeer(remotePeerId) {
   try { entry.pc.close(); } catch { /* already closed */ }
 
   peers.delete(remotePeerId);
+  orphanCandidates.delete(remotePeerId);
   console.log(`${TAG} Removed peer ${remotePeerId}`);
   reportChannelState();
 }
@@ -312,6 +355,13 @@ function removePeer(remotePeerId) {
  * @param {string[]} peerIds - every peer in the room, this one included
  */
 function syncPeers(peerIds) {
+  if (!hasIdentity()) {
+    // Without an identity this peer cannot exclude itself from the list and
+    // would open a connection to itself.
+    console.debug(`${TAG} Ignoring SYNC_PEERS before INIT`);
+    return;
+  }
+
   const desired = new Set(
     (Array.isArray(peerIds) ? peerIds : []).filter((id) => id && id !== localPeerId)
   );
@@ -334,6 +384,12 @@ function syncPeers(peerIds) {
  * @param {RTCSessionDescriptionInit} sdp
  */
 async function handleOffer(remotePeerId, sdp) {
+  if (!hasIdentity()) {
+    // Answering now would fix a role computed against a null identity.
+    console.debug(`${TAG} Ignoring offer from ${remotePeerId} before INIT`);
+    return;
+  }
+
   let entry = peers.get(remotePeerId);
   if (!entry) {
     // An offer can arrive before the room list does; trust the offer.
@@ -350,7 +406,7 @@ async function handleOffer(remotePeerId, sdp) {
 
   entry.ignoreOffer = !polite && !readyForOffer;
   if (entry.ignoreOffer) {
-    console.warn(`${TAG} Ignoring colliding offer from ${remotePeerId} (impolite peer)`);
+    console.debug(`${TAG} Ignoring colliding offer from ${remotePeerId} (impolite peer)`);
     return;
   }
 
@@ -372,7 +428,7 @@ async function handleOffer(remotePeerId, sdp) {
 async function handleAnswer(remotePeerId, sdp) {
   const entry = peers.get(remotePeerId);
   if (!entry) {
-    console.warn(`${TAG} Answer from unknown peer ${remotePeerId}`);
+    console.debug(`${TAG} Answer from unknown peer ${remotePeerId}`);
     return;
   }
 
@@ -396,7 +452,14 @@ async function handleAnswer(remotePeerId, sdp) {
 async function handleIceCandidate(remotePeerId, candidate) {
   const entry = peers.get(remotePeerId);
   if (!entry) {
-    console.warn(`${TAG} ICE candidate from unknown peer ${remotePeerId}`);
+    // The entry does not exist *yet*. Hold the candidate rather than dropping
+    // it; addPeer drains this the moment the peer is created.
+    const queued = orphanCandidates.get(remotePeerId) || [];
+    if (queued.length < MAX_ORPHAN_CANDIDATES) {
+      queued.push(candidate);
+      orphanCandidates.set(remotePeerId, queued);
+    }
+    console.debug(`${TAG} Holding early ICE candidate for ${remotePeerId}`);
     return;
   }
 
@@ -465,6 +528,7 @@ function reset() {
     removePeer(remotePeerId);
   }
   peers.clear();
+  orphanCandidates.clear();
 }
 
 /**

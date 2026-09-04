@@ -44,6 +44,17 @@ const FALLBACK_ICE_SERVERS = [
 /** ICE servers are cached for this long so a rejoin does not refetch. */
 const ICE_CACHE_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * How long to wait for ICE servers before giving up and using STUN.
+ *
+ * This fetch sits in front of joining a room, because the offscreen document
+ * must know its identity before the socket can deliver a peer list. A free-tier
+ * server waking from idle can take a minute to answer, and making someone wait
+ * that long to join — when STUN alone would have worked on their network — is a
+ * far worse trade than losing TURN for one session.
+ */
+const ICE_FETCH_TIMEOUT_MS = 8000;
+
 export class WebRTCTransport extends Transport {
   constructor() {
     super();
@@ -451,8 +462,14 @@ export class WebRTCTransport extends Transport {
       return this._iceCache.servers;
     }
 
+    const abort = new AbortController();
+    const timeoutId = setTimeout(() => abort.abort(), ICE_FETCH_TIMEOUT_MS);
+
     try {
-      const response = await fetch(ICE_ENDPOINT, { cache: 'no-store' });
+      const response = await fetch(ICE_ENDPOINT, {
+        cache: 'no-store',
+        signal: abort.signal,
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
       const body = await response.json();
@@ -467,11 +484,13 @@ export class WebRTCTransport extends Transport {
       );
       return body.iceServers;
     } catch (err) {
-      console.warn(
-        '[WebRTCTransport] ICE fetch failed, using STUN-only fallback:',
-        err.message
-      );
+      const reason = err.name === 'AbortError'
+        ? `no response in ${ICE_FETCH_TIMEOUT_MS}ms`
+        : err.message;
+      console.warn(`[WebRTCTransport] ICE fetch failed (${reason}); using STUN only`);
       return FALLBACK_ICE_SERVERS;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 }

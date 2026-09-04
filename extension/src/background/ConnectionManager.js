@@ -22,6 +22,9 @@ const P2P_THRESHOLD = 5;
 /** Settling time before acting on a transport-state change. */
 const TRANSPORT_EVAL_DEBOUNCE_MS = 300;
 
+/** Minimum gap between attempts to rebuild a mesh that failed to form. */
+const MESH_REPAIR_INTERVAL_MS = 10000;
+
 /**
  * Structural messages are delivered to the application regardless of which
  * transport is active, because they describe the room rather than playback.
@@ -76,6 +79,9 @@ export class ConnectionManager {
     /** @type {number|null} Debounce timer for transport evaluation */
     this._transportEvalTimerId = null;
 
+    /** @type {number} When the mesh was last re-synced after failing to form */
+    this._lastMeshRepairAt = 0;
+
     // Route WebRTC signaling out over the WebSocket. The WebSocket is kept
     // connected for the whole session precisely so this path always exists.
     this._rtcTransport.onSignaling((msg) => {
@@ -124,14 +130,22 @@ export class ConnectionManager {
     this._peerId = peerId;
     this._peers = new Set([peerId]);
 
-    // WebSocket first: it carries signaling and is the fallback data path.
-    await this._wsTransport.connect(roomId, peerId);
-
     // Start on the relay. The mesh is only adopted once it is demonstrably up.
     this._activeTransport = this._wsTransport;
 
-    // Peer connections are established when the server names the room's peers.
+    // The WebRTC host must know its own identity BEFORE the socket opens.
+    //
+    // The server sends ROOM_STATE and broadcasts JOIN the instant a socket
+    // connects. Opening the socket first lets those arrive while this call is
+    // still awaiting its ICE-server fetch, so syncPeers reaches an
+    // uninitialised offscreen document. There, a null local peer ID means the
+    // peer cannot filter itself out of the room list, and — because "null"
+    // sorts before "peer_..." — every peer concludes it is the offerer. Both
+    // sides then offer, both see a collision, and no channel ever opens.
     await this._rtcTransport.connect(roomId, peerId);
+
+    // WebSocket second: it carries signaling and is the fallback data path.
+    await this._wsTransport.connect(roomId, peerId);
 
     this._eventBus.emit('connection:established', { roomId, peerId });
     console.log(`[ConnectionManager] Connected to room ${roomId} as ${peerId}`);
@@ -322,6 +336,22 @@ export class ConnectionManager {
       roomSize <= P2P_THRESHOLD &&
       expectedChannels > 0 &&
       openChannels >= expectedChannels;
+
+    // A mesh that should exist but has no channels at all means the peer list
+    // never reached the WebRTC host, or every negotiation failed. Nothing else
+    // will re-drive it: syncPeers is only issued when membership *changes*, and
+    // a stable room produces no further changes. Re-issue it, rate-limited so a
+    // permanently unreachable peer cannot turn this into a retry loop.
+    if (
+      roomSize > 1 &&
+      roomSize <= P2P_THRESHOLD &&
+      openChannels === 0 &&
+      Date.now() - this._lastMeshRepairAt > MESH_REPAIR_INTERVAL_MS
+    ) {
+      this._lastMeshRepairAt = Date.now();
+      console.log('[ConnectionManager] Mesh expected but absent; re-syncing peers');
+      this._rtcTransport.syncPeers(Array.from(this._peers));
+    }
 
     if (meshIsViable) {
       if (this._activeTransport !== this._rtcTransport) {

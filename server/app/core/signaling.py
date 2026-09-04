@@ -21,6 +21,10 @@ BROADCAST_TYPES = (
 # corrupting latency compensation room-wide.
 UNICAST_TYPES = ("SDP_OFFER", "SDP_ANSWER", "ICE_CANDIDATE", "PONG")
 
+# WebRTC connection setup. Exempt from Lamport validation: these describe how a
+# transport is built, not what happened to the video, so they carry clock 0.
+SIGNALING_TYPES = ("SDP_OFFER", "SDP_ANSWER", "ICE_CANDIDATE")
+
 # Types whose payload updates the room's cached state for late joiners.
 STATE_TYPES = ("ROOM_STATE", "HEARTBEAT", "PLAY", "PAUSE", "SEEK")
 
@@ -110,8 +114,18 @@ async def process_message(room: Room, sender_id: str, message: Dict[str, Any]):
 
     peer = room.peers.get(sender_id)
 
-    # 1. Security & State: Validate Lamport Clock and update Peer state
-    if peer is not None:
+    # 1. Security & State: Validate Lamport Clock and update Peer state.
+    #
+    # Signaling is exempt. SDP and ICE messages are transport plumbing that sets
+    # up a connection; they carry no playback semantics and take no part in the
+    # causal ordering, so they are sent with lamportClock 0. Validating them
+    # against the peer's advancing clock reads that 0 as a clock running
+    # backwards and drops every offer, answer and candidate — which silently
+    # prevents WebRTC from ever connecting while every other message flows
+    # normally.
+    if peer is not None and msg_type in SIGNALING_TYPES:
+        peer.touch()
+    elif peer is not None:
         if clock is None:
             peer.touch()
         elif not peer.clock_initialized:

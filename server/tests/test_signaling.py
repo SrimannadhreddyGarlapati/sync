@@ -254,3 +254,90 @@ async def test_reaper_leaves_live_peers_alone():
     await mgr._reap_once()
 
     assert "peer_aaaaaaaa" in mgr.rooms["ABC123"].peers
+
+
+# ---- WebRTC signaling must survive clock validation ------------
+
+
+@pytest.mark.asyncio
+async def test_signaling_is_exempt_from_lamport_validation(wired):
+    """
+    Regression: SDP and ICE are transport plumbing, sent with lamportClock 0
+    because they take no part in the causal ordering. Once a peer had sent any
+    real message its clock had advanced, so 0 read as a clock running backwards
+    and every offer, answer and candidate was dropped. WebRTC could never
+    connect while every other message flowed normally.
+    """
+    _mgr, room, sockets = wired
+
+    # The peer has been running: heartbeats advanced its Lamport clock.
+    for clock in (1, 5, 12, 20):
+        await process_message(
+            room, "peer_aaaaaaaa",
+            _envelope("HEARTBEAT", "peer_aaaaaaaa", clock=clock, videoTime=1.0),
+        )
+    assert room.peers["peer_aaaaaaaa"].lamport_clock == 20
+    sockets["peer_bbbbbbbb"].sent.clear()
+
+    for msg_type, extra in (
+        ("SDP_OFFER", {"sdp": {"type": "offer"}}),
+        ("SDP_ANSWER", {"sdp": {"type": "answer"}}),
+        ("ICE_CANDIDATE", {"candidate": {"candidate": "host"}}),
+    ):
+        await process_message(
+            room, "peer_aaaaaaaa",
+            _envelope(msg_type, "peer_aaaaaaaa", clock=0,
+                      targetPeerId="peer_bbbbbbbb", **extra),
+        )
+
+    delivered = [m["type"] for m in sockets["peer_bbbbbbbb"].sent]
+    assert delivered == ["SDP_OFFER", "SDP_ANSWER", "ICE_CANDIDATE"]
+
+
+@pytest.mark.asyncio
+async def test_signaling_exemption_does_not_disturb_the_peer_clock(wired):
+    """The exemption must not let clock 0 reset the peer's tracked value."""
+    _mgr, room, _sockets = wired
+    await process_message(
+        room, "peer_aaaaaaaa",
+        _envelope("HEARTBEAT", "peer_aaaaaaaa", clock=30, videoTime=1.0),
+    )
+
+    await process_message(
+        room, "peer_aaaaaaaa",
+        _envelope("SDP_OFFER", "peer_aaaaaaaa", clock=0,
+                  targetPeerId="peer_bbbbbbbb", sdp={"type": "offer"}),
+    )
+
+    assert room.peers["peer_aaaaaaaa"].lamport_clock == 30
+
+
+@pytest.mark.asyncio
+async def test_playback_commands_are_still_clock_validated(wired):
+    """The exemption is narrow: it must not weaken the check for real commands."""
+    _mgr, room, sockets = wired
+    room.peers["peer_aaaaaaaa"].adopt_clock(50)
+    sockets["peer_bbbbbbbb"].sent.clear()
+
+    await process_message(
+        room, "peer_aaaaaaaa",
+        _envelope("PLAY", "peer_aaaaaaaa", clock=0, videoTime=1.0),
+    )
+
+    assert sockets["peer_bbbbbbbb"].sent == []
+
+
+@pytest.mark.asyncio
+async def test_signaling_keeps_the_peer_alive_for_the_reaper(wired):
+    """A peer mid-negotiation is active, and must not be reaped as silent."""
+    import time
+    _mgr, room, _sockets = wired
+    room.peers["peer_aaaaaaaa"].last_heartbeat = time.time() - 999
+
+    await process_message(
+        room, "peer_aaaaaaaa",
+        _envelope("ICE_CANDIDATE", "peer_aaaaaaaa", clock=0,
+                  targetPeerId="peer_bbbbbbbb", candidate={"candidate": "host"}),
+    )
+
+    assert room.peers["peer_aaaaaaaa"].is_stale(45.0) is False
