@@ -73,12 +73,55 @@ and set the two variables above. `GET /turn-credentials` then mints short-lived
 credentials per client, so the long-term key never ships inside the extension.
 Cloudflare's free allowance is 1000 GB/month.
 
+## Measuring latency
+
+`server/tools/latency_probe.py` connects two synthetic peers to a live room and
+times the same paths the extension uses. Both peers run in one process, so every
+timestamp comes from a single clock:
+
+```bash
+cd server && PYTHONPATH=. python tools/latency_probe.py --samples 20
+```
+
+It reports the socket handshake, the one-way `sender → server → receiver` path a
+`PLAY` command takes, and the four-leg round trip `PING`/`PONG` measures. Since
+it adds no application overhead, anything the popup reports materially above the
+probe's round trip is overhead inside the extension rather than network time.
+
+**Reading the popup's RTT.** On the relay it is a four-leg loop — you → server →
+host → server → you — so it reads about twice as large as a plain ping to the
+server. Compensation uses half of it. A measurement from India to a Singapore
+region looks like this:
+
+| Path | Median |
+|---|---|
+| one way (client → server → host) | ~95 ms |
+| round trip (`PING`/`PONG`) | ~196 ms |
+| implied per-leg India↔Singapore | ~49 ms |
+
+That is the physical cost of relaying, not a defect — and it is precisely what
+P2P removes, since a direct path between two peers on one network is single-digit
+milliseconds.
+
 ### Deployment notes
 
 The server is deployed on Render's free tier, which is a reasonable fit:
 WebSocket messages count as inbound traffic, so an active room keeps the service
 awake on its own. Only the first joiner after 15 minutes of complete idle pays
-the ~1 minute cold start.
+the cold start.
+
+**Warm it before a demo.** A measured cold start took 23 seconds to first byte,
+and the first WebSocket handshake 3 seconds. That is by far the worst latency in
+the system, and it hits exactly when someone is watching:
+
+```bash
+curl -s -o /dev/null -w "%{time_total}s\n" https://sync-l5pk.onrender.com/
+```
+
+Run it a couple of minutes beforehand and the room joins instantly. A scheduled
+ping would keep it warm permanently, but an always-on free service consumes
+about 730 of the 750 monthly instance hours, leaving nothing for a second
+service — so warming on demand is usually the better trade.
 
 Pick the region closest to your users at service creation — Render cannot change
 a service's region in place.

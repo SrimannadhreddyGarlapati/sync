@@ -30,6 +30,9 @@
   /** @type {number|null} Poll timer for link diagnostics while the popup is open */
   let statusPollId = null;
 
+  /** @type {boolean} Whether the last render showed a room, so we can spot leaving one */
+  let wasInRoom = false;
+
   // ── IPC Helper ──────────────────────────────────────────────
 
   /**
@@ -99,8 +102,15 @@
     } else {
       viewDisconnected.classList.remove('hidden');
       viewConnected.classList.add('hidden');
-      inputRoomCode.value = ''; // Clear on disconnect
+
+      // Clear only on the transition out of a room, never on a plain re-render.
+      // Status is polled every 2s to keep the transport and RTT readings live,
+      // and clearing unconditionally wiped whatever the user was mid-way
+      // through typing.
+      if (wasInRoom) inputRoomCode.value = '';
     }
+
+    wasInRoom = Boolean(status.roomId);
   }
 
   /**
@@ -120,15 +130,34 @@
     if (transport === 'WebRTC') {
       transportChip.textContent = 'P2P · WebRTC';
       transportChip.classList.add('p2p');
+      transportChip.title = 'Commands travel directly between peers';
     } else if (transport === 'WebSocket') {
       transportChip.textContent = 'Relay · WebSocket';
       transportChip.classList.add('relay');
+      transportChip.title = 'Commands are relayed through the server';
     } else {
       transportChip.textContent = 'No transport';
+      transportChip.title = '';
     }
 
     const rtt = status.rttMs;
     latencyChip.textContent = rtt > 0 ? `${rtt} ms RTT` : 'measuring…';
+
+    // Spell out what the number covers. On the relay it is a four-leg loop
+    // (you → server → host → server → you), so it reads about twice as large
+    // as a plain ping to the server and invites the conclusion that something
+    // is broken. Half of it is the one-way delay compensation actually applies.
+    if (rtt > 0 && transport === 'WebRTC') {
+      latencyChip.title =
+        `Direct round trip to the host peer. ` +
+        `Compensation advances playback by ${Math.round(rtt / 2)} ms.`;
+    } else if (rtt > 0) {
+      latencyChip.title =
+        `Round trip through the relay: you → server → host → server → you. ` +
+        `Compensation advances playback by ${Math.round(rtt / 2)} ms.`;
+    } else {
+      latencyChip.title = 'Waiting for the first round-trip sample';
+    }
   }
 
   /**
@@ -244,6 +273,11 @@
   }
 
   async function init() {
+    // Read the version rather than hardcoding it in the markup, where it goes
+    // stale and makes a freshly reloaded build look like the old one.
+    const versionEl = document.getElementById('version');
+    if (versionEl) versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+
     await refreshStatus();
 
     // RTT and transport change without any state transition to announce them,

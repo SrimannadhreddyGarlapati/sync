@@ -45,6 +45,18 @@ Every peer maintains a Lamport logical clock:
 This ensures a total ordering of all events across the distributed system,
 used to deterministically resolve concurrent commands.
 
+The server rejects a clock that jumps more than 100 ahead of a peer's last
+value, or that moves backwards, as a spoofing attempt.
+
+**Signaling is exempt from that check.** `SDP_OFFER`, `SDP_ANSWER` and
+`ICE_CANDIDATE` describe how a transport gets built, not what happened to the
+video, so they take no part in the causal ordering and are sent with
+`lamportClock: 0`. Validating them against a peer's advancing clock reads that
+0 as a clock running backwards — which drops every offer, answer and candidate
+while every other message flows normally, so WebRTC can never connect and the
+room silently stays on the relay forever. Signaling still refreshes the peer's
+liveness timestamp, so a peer mid-negotiation is not reaped as silent.
+
 ### Latency Compensation
 
 `payload.originTimestamp` is the sender's wall-clock time (`Date.now()`) when
