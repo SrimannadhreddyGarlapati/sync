@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import WebSocket
@@ -16,6 +17,14 @@ PEER_STALE_TIMEOUT_S = 45.0
 # How often the reaper sweeps every room for dead peers.
 REAPER_INTERVAL_S = 15.0
 
+# How long a vacated room's playback position is remembered.
+#
+# Deleting a room the instant it empties means a transient blip that briefly
+# drops everyone -- a WiFi hiccup, a redeploy -- loses the position, so the
+# room reforms at 0 and yanks every viewer back to the start of the video.
+# Holding the position briefly makes a rejoin resume where they left off.
+ROOM_STATE_GRACE_S = 120.0
+
 
 class ConnectionManager:
     """
@@ -25,6 +34,9 @@ class ConnectionManager:
         # Mapping of room_id -> Room object
         self.rooms: Dict[str, Room] = {}
         self._reaper_task: Optional[asyncio.Task] = None
+
+        # room_id -> (vacated_at, playback snapshot), see ROOM_STATE_GRACE_S.
+        self._retained_state: Dict[str, Tuple[float, dict]] = {}
 
     async def connect(self, websocket: WebSocket, room_id: str, peer_id: str) -> Room:
         """
@@ -36,6 +48,7 @@ class ConnectionManager:
         if room_id not in self.rooms:
             logger.info(f"Creating new room: {room_id}")
             self.rooms[room_id] = Room(room_id)
+            self._restore_state(self.rooms[room_id])
 
         room = self.rooms[room_id]
 
@@ -85,7 +98,8 @@ class ConnectionManager:
         logger.info(f"Peer {peer_id} left room {room_id}. Total peers: {len(room.peers)}")
 
         if not room.peers:
-            logger.info(f"Room {room_id} is empty. Deleting room.")
+            logger.info(f"Room {room_id} is empty. Retaining its position briefly.")
+            self._retain_state(room)
             del self.rooms[room_id]
             return None, True
 
@@ -150,6 +164,47 @@ class ConnectionManager:
         """Get a room by ID."""
         return self.rooms.get(room_id)
 
+    # ---- Retained playback position ----------------------------
+
+    def _retain_state(self, room: Room) -> None:
+        """Remember a vacated room's position so a quick rejoin resumes it."""
+        if room.last_known_video_id is None:
+            return  # Nothing worth keeping.
+
+        self._retained_state[room.id] = (time.time(), {
+            "last_known_time": room.projected_time(),
+            "last_known_state": room.last_known_state,
+            "last_known_video_id": room.last_known_video_id,
+        })
+
+    def _restore_state(self, room: Room) -> None:
+        """Reapply a recently retained position to a room being recreated."""
+        entry = self._retained_state.pop(room.id, None)
+        if entry is None:
+            return
+
+        vacated_at, snapshot = entry
+        if time.time() - vacated_at > ROOM_STATE_GRACE_S:
+            return  # Too old to be the same viewing session.
+
+        room.last_known_time = snapshot["last_known_time"]
+        room.last_known_state = snapshot["last_known_state"]
+        room.last_known_video_id = snapshot["last_known_video_id"]
+        room.mark_state_observed()
+
+        logger.info(
+            f"Restored room {room.id} at {room.last_known_time:.1f}s "
+            f"({room.last_known_state})"
+        )
+
+    def _expire_retained_state(self) -> None:
+        """Drop snapshots nobody came back for."""
+        cutoff = time.time() - ROOM_STATE_GRACE_S
+        for room_id in [
+            rid for rid, (at, _) in self._retained_state.items() if at < cutoff
+        ]:
+            del self._retained_state[room_id]
+
     # ---- Stale peer reaping ------------------------------------
 
     def start_reaper(self) -> None:
@@ -178,6 +233,7 @@ class ConnectionManager:
             try:
                 await asyncio.sleep(REAPER_INTERVAL_S)
                 await self._reap_once()
+                self._expire_retained_state()
             except asyncio.CancelledError:
                 raise
             except Exception as e:

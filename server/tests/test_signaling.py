@@ -341,3 +341,165 @@ async def test_signaling_keeps_the_peer_alive_for_the_reaper(wired):
     )
 
     assert room.peers["peer_aaaaaaaa"].is_stale(45.0) is False
+
+
+# ---- Liveness while the room runs over P2P ---------------------
+
+
+@pytest.mark.asyncio
+async def test_keepalive_refreshes_liveness_without_being_relayed(wired):
+    """
+    Regression: once a room is on WebRTC every playback message travels on the
+    DataChannel, so the server sees nothing at all on that peer's WebSocket —
+    indistinguishable from a dead connection. The reaper then closed the socket
+    of a perfectly healthy peer, and reaping the last one deleted the room along
+    with the position everyone resyncs to, restarting the video from zero.
+    """
+    import time
+    _mgr, room, sockets = wired
+    room.peers["peer_aaaaaaaa"].last_heartbeat = time.time() - 999
+    assert room.peers["peer_aaaaaaaa"].is_stale(45.0) is True
+
+    await process_message(room, "peer_aaaaaaaa", {
+        "type": "KEEPALIVE",
+        "roomId": "ABC123",
+        "senderId": "peer_aaaaaaaa",
+        "payload": {"hasActiveTab": True, "originTimestamp": 1},
+    })
+
+    assert room.peers["peer_aaaaaaaa"].is_stale(45.0) is False
+    assert sockets["peer_bbbbbbbb"].sent == [], "no other peer has any use for it"
+    assert sockets["peer_cccccccc"].sent == []
+
+
+@pytest.mark.asyncio
+async def test_keepalive_carries_no_clock_and_is_never_rejected(wired):
+    """
+    It has no lamportClock on purpose: the peer's real clock advanced over the
+    DataChannel, which the server never saw, so any value would look like a jump.
+    """
+    _mgr, room, _sockets = wired
+    room.peers["peer_aaaaaaaa"].adopt_clock(500)
+
+    await process_message(room, "peer_aaaaaaaa", {
+        "type": "KEEPALIVE",
+        "roomId": "ABC123",
+        "senderId": "peer_aaaaaaaa",
+        "payload": {"hasActiveTab": True},
+    })
+
+    assert room.peers["peer_aaaaaaaa"].is_stale(45.0) is False
+    assert room.peers["peer_aaaaaaaa"].lamport_clock == 500, "clock left untouched"
+
+
+@pytest.mark.asyncio
+async def test_keepalive_updates_tab_eligibility_for_host_election(wired):
+    _mgr, room, _sockets = wired
+    assert room.peers["peer_aaaaaaaa"].has_active_tab is False
+
+    await process_message(room, "peer_aaaaaaaa", {
+        "type": "KEEPALIVE",
+        "roomId": "ABC123",
+        "senderId": "peer_aaaaaaaa",
+        "payload": {"hasActiveTab": True},
+    })
+
+    assert room.peers["peer_aaaaaaaa"].has_active_tab is True
+
+
+@pytest.mark.asyncio
+async def test_a_keepalive_run_survives_the_reaper():
+    """End to end: a peer that only sends keepalives is never reaped."""
+    import time
+    from app.managers.connection_manager import PEER_STALE_TIMEOUT_S
+
+    mgr = ConnectionManager()
+    sock_a = FakeAcceptingSocket("a")
+    sock_b = FakeAcceptingSocket("b")
+    await mgr.connect(sock_a, "ABC123", "peer_aaaaaaaa")
+    await mgr.connect(sock_b, "ABC123", "peer_bbbbbbbb")
+
+    room = mgr.rooms["ABC123"]
+
+    # 15s keepalives across a span far longer than the 45s timeout.
+    elapsed = 0.0
+    while elapsed < PEER_STALE_TIMEOUT_S * 3:
+        elapsed += 15.0
+        for peer in room.peers.values():
+            peer.touch()
+        await mgr._reap_once()
+
+    assert len(mgr.rooms["ABC123"].peers) == 2
+    assert sock_a.closed_with is None
+    assert sock_b.closed_with is None
+
+
+# ---- Retained playback position --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_vacated_room_remembers_where_it_was():
+    """
+    A blip that briefly drops everyone used to delete the room, so it reformed
+    at 0 and yanked every viewer back to the start of the video.
+    """
+    mgr = ConnectionManager()
+    sock = FakeAcceptingSocket("a")
+    await mgr.connect(sock, "ABC123", "peer_aaaaaaaa")
+
+    room = mgr.rooms["ABC123"]
+    room.last_known_video_id = "dQw4w9WgXcQ"
+    room.last_known_time = 137.5
+    room.last_known_state = "paused"
+    room.mark_state_observed()
+
+    await mgr.disconnect("ABC123", "peer_aaaaaaaa", sock)
+    assert "ABC123" not in mgr.rooms
+
+    rejoined = FakeAcceptingSocket("a2")
+    await mgr.connect(rejoined, "ABC123", "peer_aaaaaaaa")
+
+    restored = mgr.rooms["ABC123"]
+    assert restored.last_known_video_id == "dQw4w9WgXcQ"
+    assert restored.last_known_time == 137.5
+    assert restored.last_known_state == "paused"
+
+
+@pytest.mark.asyncio
+async def test_a_long_abandoned_room_starts_fresh():
+    import time
+    from app.managers.connection_manager import ROOM_STATE_GRACE_S
+
+    mgr = ConnectionManager()
+    sock = FakeAcceptingSocket("a")
+    await mgr.connect(sock, "ABC123", "peer_aaaaaaaa")
+    mgr.rooms["ABC123"].last_known_video_id = "vid"
+    mgr.rooms["ABC123"].last_known_time = 99.0
+    await mgr.disconnect("ABC123", "peer_aaaaaaaa", sock)
+
+    # Someone reusing the code hours later is a different viewing session.
+    stamp, snapshot = mgr._retained_state["ABC123"]
+    mgr._retained_state["ABC123"] = (stamp - ROOM_STATE_GRACE_S - 60, snapshot)
+
+    await mgr.connect(FakeAcceptingSocket("b"), "ABC123", "peer_bbbbbbbb")
+
+    assert mgr.rooms["ABC123"].last_known_time == 0.0
+    assert mgr.rooms["ABC123"].last_known_video_id is None
+
+
+@pytest.mark.asyncio
+async def test_retained_snapshots_are_eventually_dropped():
+    from app.managers.connection_manager import ROOM_STATE_GRACE_S
+
+    mgr = ConnectionManager()
+    sock = FakeAcceptingSocket("a")
+    await mgr.connect(sock, "ABC123", "peer_aaaaaaaa")
+    mgr.rooms["ABC123"].last_known_video_id = "vid"
+    await mgr.disconnect("ABC123", "peer_aaaaaaaa", sock)
+    assert "ABC123" in mgr._retained_state
+
+    stamp, snapshot = mgr._retained_state["ABC123"]
+    mgr._retained_state["ABC123"] = (stamp - ROOM_STATE_GRACE_S - 60, snapshot)
+    mgr._expire_retained_state()
+
+    assert mgr._retained_state == {}, "snapshots must not accumulate forever"

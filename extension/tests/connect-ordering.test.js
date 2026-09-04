@@ -253,3 +253,57 @@ test('a healthy mesh is never needlessly re-synced', async () => {
   assert.deepEqual(syncCalls, [], 're-syncing would reset working connections');
   assert.equal(manager.getActiveTransportName(), 'WebRTC');
 });
+
+// ---- Liveness while the mesh carries playback -------------------
+
+test('a re-INIT for the same session keeps working connections', async () => {
+  const rig = buildOffscreen();
+  await rig.call({ op: 'INIT', roomId: 'ABC123', peerId: 'peer_zzzzzzzz' });
+  await rig.call({ op: 'SYNC_PEERS', peerIds: ['peer_aaaaaaaa', 'peer_zzzzzzzz'] });
+  await rig.settle();
+
+  const pc = FakeRTCPeerConnection.instances[0];
+  assert.ok(pc, 'a connection should exist');
+
+  // A WebSocket blip makes the worker re-run connect, which re-sends INIT. That
+  // says nothing about the health of the peer connections, and renegotiating
+  // takes seconds — long enough for the room to drop back to the relay.
+  await rig.call({ op: 'INIT', roomId: 'ABC123', peerId: 'peer_zzzzzzzz' });
+
+  assert.ok(!pc.closed, 'a healthy connection must survive a reconnect');
+  const state = await rig.call({ op: 'GET_STATE' });
+  assert.deepEqual(state.peerIds, ['peer_aaaaaaaa']);
+});
+
+test('a genuinely new session still starts clean', async () => {
+  const rig = buildOffscreen();
+  await rig.call({ op: 'INIT', roomId: 'ABC123', peerId: 'peer_zzzzzzzz' });
+  await rig.call({ op: 'SYNC_PEERS', peerIds: ['peer_aaaaaaaa', 'peer_zzzzzzzz'] });
+  await rig.settle();
+
+  await rig.call({ op: 'INIT', roomId: 'XYZ789', peerId: 'peer_zzzzzzzz' });
+
+  assert.ok(FakeRTCPeerConnection.instances[0].closed);
+  const state = await rig.call({ op: 'GET_STATE' });
+  assert.deepEqual(state.peerIds, []);
+});
+
+test('the keepalive takes the WebSocket even while the mesh is active', async () => {
+  const { ConnectionManager: CM } = await import('../src/background/ConnectionManager.js');
+  const { EventBus: Bus } = await import('../src/background/EventBus.js');
+
+  const manager = new CM(new Bus());
+  const viaRelay = [];
+  const viaMesh = [];
+  manager._wsTransport.send = (m) => viaRelay.push(m);
+  manager._rtcTransport.send = (m) => viaMesh.push(m);
+  manager._rtcTransport.isConnected = () => true;
+  manager._activeTransport = manager._rtcTransport;
+
+  manager.send({ type: 'PLAY' });
+  manager.sendViaRelay({ type: 'KEEPALIVE' });
+
+  // Playback belongs on the fast path; liveness has to be visible to the server.
+  assert.deepEqual(viaMesh.map((m) => m.type), ['PLAY']);
+  assert.deepEqual(viaRelay.map((m) => m.type), ['KEEPALIVE']);
+});
