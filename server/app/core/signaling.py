@@ -28,6 +28,19 @@ SIGNALING_TYPES = ("SDP_OFFER", "SDP_ANSWER", "ICE_CANDIDATE")
 # Types whose payload updates the room's cached state for late joiners.
 STATE_TYPES = ("ROOM_STATE", "HEARTBEAT", "PLAY", "PAUSE", "SEEK")
 
+# Proof a peer is still there, and nothing else.
+#
+# Once a room is running over WebRTC, every playback message travels on the
+# DataChannel and the server sees nothing at all on that peer's WebSocket. It
+# looks identical to a dead connection, so without this the stale-peer reaper
+# kills peers that are perfectly healthy — and taking the last one out deletes
+# the room, losing the playback position everyone resyncs to.
+#
+# Sent with no lamportClock: it carries no application meaning, and the peer's
+# real clock has been advancing over a channel the server cannot observe, so
+# there is nothing here to validate against.
+KEEPALIVE_TYPE = "KEEPALIVE"
+
 # Reject a clock that leaps further than this ahead of the peer's last value.
 MAX_CLOCK_DELTA = 100
 
@@ -113,6 +126,15 @@ async def process_message(room: Room, sender_id: str, message: Dict[str, Any]):
     clock = message.get("lamportClock")
 
     peer = room.peers.get(sender_id)
+
+    # 0. Liveness only. Never relayed: no other peer has any use for it.
+    if msg_type == KEEPALIVE_TYPE:
+        if peer is not None:
+            peer.touch()
+            if "hasActiveTab" in payload:
+                # Host election still needs to know who has a playable tab.
+                peer.has_active_tab = bool(payload["hasActiveTab"])
+        return
 
     # 1. Security & State: Validate Lamport Clock and update Peer state.
     #

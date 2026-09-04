@@ -46,6 +46,17 @@ const HEARTBEAT_INTERVAL_MS = 2000;
 const PING_INTERVAL_MS = 6000;
 
 /**
+ * How often to prove this peer is still connected, over the WebSocket.
+ *
+ * Once the mesh carries playback the WebSocket falls completely silent, which
+ * the server cannot tell apart from a dead connection: its stale-peer reaper
+ * would close the socket of a peer that is working perfectly, and reaping the
+ * last one deletes the room along with the playback position everyone resyncs
+ * to. Comfortably under the server's 45s timeout, so two can be lost.
+ */
+const KEEPALIVE_INTERVAL_MS = 15000;
+
+/**
  * Drift above which a correction is issued.
  *
  * Below this the correction itself would be more disruptive than the error.
@@ -287,6 +298,15 @@ export class SyncEngine {
         this._handleHeartbeat(wireMessage).catch((err) => {
           console.error('[SyncEngine] Heartbeat handling failed:', err);
         });
+        return;
+
+      case 'JOIN':
+      case 'LEAVE':
+      case 'KEEPALIVE':
+        // Membership is ConnectionManager's business and was already applied
+        // before this point. They reach here only because every inbound message
+        // does; passing them to CommandFactory just logs "Unknown command type"
+        // on each one and buries the real errors.
         return;
 
       default:
@@ -849,8 +869,38 @@ export class SyncEngine {
         this._fireAndForget(this._sampleTransportRtt(), 'RTT sampling');
       }
 
+      this._sendKeepaliveIfDue(hasActiveTab);
       this._fireAndForget(this._persistState(), 'state persist');
     }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  /**
+   * Prove to the server that this peer is still here, over the WebSocket.
+   *
+   * Sent by host and client alike, and deliberately not routed through
+   * `sendAction`: once the mesh is active that would put it on the DataChannel,
+   * where the server cannot see it, which is the whole problem this solves.
+   *
+   * It carries no lamportClock. The peer's real clock has been advancing over
+   * a channel the server never observed, so there is nothing to validate
+   * against and any value would look like a jump.
+   *
+   * @param {boolean} hasActiveTab
+   * @private
+   */
+  _sendKeepaliveIfDue(hasActiveTab) {
+    const ticksPerKeepalive = Math.max(
+      1,
+      Math.round(KEEPALIVE_INTERVAL_MS / HEARTBEAT_INTERVAL_MS)
+    );
+    if (this._heartbeatTick % ticksPerKeepalive !== 0) return;
+
+    this.connectionManager.sendViaRelay({
+      type: 'KEEPALIVE',
+      roomId: this._roomId,
+      senderId: this._peerId,
+      payload: { hasActiveTab, originTimestamp: Date.now() },
+    });
   }
 
   /** @private */

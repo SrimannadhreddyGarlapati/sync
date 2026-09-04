@@ -578,9 +578,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       switch (message.op) {
         case 'INIT': {
-          // A fresh room, or a service-worker restart. Either way, start clean:
-          // the worker's view of the mesh is authoritative.
-          reset();
+          // Keep working connections when the identity has not changed.
+          //
+          // INIT arrives again whenever the service worker re-runs connect —
+          // including after a WebSocket blip, which says nothing about the
+          // health of the peer connections. Resetting unconditionally tore down
+          // a live mesh on every reconnect, and since renegotiating takes
+          // seconds the room fell back to the relay each time. A genuinely new
+          // room or peer ID still starts clean, and SYNC_PEERS reconciles
+          // whatever survived.
+          const sameSession =
+            localPeerId === message.peerId && roomId === message.roomId;
+
+          if (!sameSession) {
+            reset();
+          } else if (peers.size > 0) {
+            console.log(`${TAG} Re-INIT for the same session; keeping ${peers.size} connection(s)`);
+          }
+
           localPeerId = message.peerId || null;
           roomId = message.roomId || null;
           if (Array.isArray(message.iceServers) && message.iceServers.length > 0) {

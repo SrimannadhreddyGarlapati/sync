@@ -482,3 +482,67 @@ test('switching transport discards stale RTT samples', async () => {
 
   assert.equal(engine.clockSync.sampleCount, 0);
 });
+
+// ── Keepalive ───────────────────────────────────────────────────
+
+test('the keepalive is sent over the relay, never the active transport', async () => {
+  const { engine, sent } = await buildEngine({
+    videoState: { videoId: 'v', videoTime: 1, isPaused: false, duration: 9, isReady: true },
+  });
+
+  const viaRelay = [];
+  engine.connectionManager.sendViaRelay = (m) => viaRelay.push(m);
+
+  engine._heartbeatTick = Math.round(15000 / 2000); // a keepalive is due
+  engine._sendKeepaliveIfDue(true);
+
+  assert.equal(viaRelay.length, 1);
+  assert.equal(viaRelay[0].type, 'KEEPALIVE');
+  assert.equal(viaRelay[0].senderId, 'peer_bbbbbbbb');
+  assert.equal(viaRelay[0].payload.hasActiveTab, true);
+
+  // sendAction would put it on the DataChannel once the mesh is up, where the
+  // server cannot see it — which is the entire problem it exists to solve.
+  assert.deepEqual(sent.filter((m) => m.type === 'KEEPALIVE'), []);
+});
+
+test('the keepalive carries no Lamport clock', async () => {
+  const { engine } = await buildEngine();
+  const viaRelay = [];
+  engine.connectionManager.sendViaRelay = (m) => viaRelay.push(m);
+
+  engine._heartbeatTick = Math.round(15000 / 2000);
+  engine._sendKeepaliveIfDue(false);
+
+  // The peer's real clock advanced over a channel the server never saw, so any
+  // value here would look like a jump and be rejected.
+  assert.ok(!('lamportClock' in viaRelay[0]));
+});
+
+test('the keepalive is throttled, not sent every tick', async () => {
+  const { engine } = await buildEngine();
+  const viaRelay = [];
+  engine.connectionManager.sendViaRelay = (m) => viaRelay.push(m);
+
+  for (let tick = 1; tick <= 8; tick++) {
+    engine._heartbeatTick = tick;
+    engine._sendKeepaliveIfDue(true);
+  }
+
+  // 15s cadence against a 2s heartbeat: roughly one in eight ticks.
+  assert.equal(viaRelay.length, 1, `expected 1 keepalive in 8 ticks, got ${viaRelay.length}`);
+});
+
+test('membership messages do not reach the command factory', async () => {
+  const { engine } = await buildEngine();
+  const commands = [];
+  engine.eventBus.on('command:received', (payload) => commands.push(payload));
+
+  for (const type of ['JOIN', 'LEAVE', 'KEEPALIVE']) {
+    engine.handleSyncMessage(envelope(type, { peerId: OTHER_ID }, 'server'));
+  }
+
+  // ConnectionManager already applied these; passing them on only logged
+  // "Unknown command type" for each and buried the real errors.
+  assert.deepEqual(commands, []);
+});

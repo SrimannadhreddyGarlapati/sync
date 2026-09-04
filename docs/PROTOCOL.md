@@ -46,7 +46,8 @@ This ensures a total ordering of all events across the distributed system,
 used to deterministically resolve concurrent commands.
 
 The server rejects a clock that jumps more than 100 ahead of a peer's last
-value, or that moves backwards, as a spoofing attempt.
+value, or that moves backwards, as a spoofing attempt. `KEEPALIVE` omits the
+field entirely and is exempt for the same reason signaling is.
 
 **Signaling is exempt from that check.** `SDP_OFFER`, `SDP_ANSWER` and
 `ICE_CANDIDATE` describe how a transport gets built, not what happened to the
@@ -130,6 +131,21 @@ adapter falls back to a seek.
 | `PONG` | `{ targetPeerId, pingOriginTimestamp }` | Host's reply, **addressed to the asker only** |
 | `ROOM_STATE` | `{ videoTime, isPaused, videoId, peers[], hostId }` | Full room state snapshot (for late joiners and video switches) |
 | `REQUEST_STATE` | `{}` | Sent by a joining peer to ask the host to broadcast `ROOM_STATE` |
+| `KEEPALIVE` | `{ hasActiveTab, originTimestamp }` | Proof of life, **always over the WebSocket**. Never relayed. |
+
+**`KEEPALIVE` exists because a healthy P2P room looks dead to the server.**
+Once the mesh carries playback, every `PLAY`, `PAUSE`, `HEARTBEAT` and `PING`
+travels on the DataChannel, and the peer's WebSocket goes completely silent —
+indistinguishable from a dropped connection. The stale-peer reaper then closes
+the socket of a peer that is working perfectly, and reaping the last one deletes
+the room along with the playback position everyone resyncs to, restarting the
+video from zero.
+
+It is sent every 15s by host and clients alike, deliberately bypassing transport
+selection, and carries **no `lamportClock`** — the peer's real clock has been
+advancing over a channel the server never observed, so any value would look like
+a jump. The server refreshes liveness and `hasActiveTab` from it and relays it
+to nobody.
 
 `PONG` carries `targetPeerId` and is **unicast**, not broadcast. It echoes the
 *asker's* `originTimestamp`, so any other peer receiving it would compute

@@ -169,6 +169,21 @@ export class ConnectionManager {
   }
 
   /**
+   * Send a message over the WebSocket specifically, whatever transport is active.
+   *
+   * Once the mesh is carrying playback, `send` routes everything to the
+   * DataChannel and the WebSocket goes completely silent — which is
+   * indistinguishable, from the server's side, from a dead connection. The
+   * socket is still needed for signaling and as the fallback, so it has to be
+   * visibly alive even while nothing else is using it.
+   *
+   * @param {object} message - Wire protocol message
+   */
+  sendViaRelay(message) {
+    this._wsTransport.send(message);
+  }
+
+  /**
    * Register a handler for incoming messages.
    * @param {Function} callback
    */
